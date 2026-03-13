@@ -1,0 +1,133 @@
+---
+title: Introduction
+description: A distributed data platform for processing Movies, TV Series, and People data at scale
+---
+
+## What is the Entertainment Data Platform?
+
+The **Entertainment Data Platform** is a high-performance data engineering ecosystem built to process and organize large-scale Movies, TV Series, and People data. By implementing a Medallion Architecture (Bronze → Silver → Gold) powered by Delta Lake, the platform effectively bridges the gap between raw, chaotic Kafka streams and specialized downstream applications.
+
+The system ensures data reliability through ACID transactions and optimizes performance by using an intelligent change-tracking mechanism, ensuring updates to expensive Graph (Neo4j) and Vector (Pinecone) databases with high efficiency.
+
+## Core Objectives
+
+The platform is designed with three primary goals:
+
+<CardGroup cols={3}>
+  <Card title="Scalable Ingestion" icon="bolt">
+    Handling high-velocity data with Spark Streaming and Kafka
+  </Card>
+  <Card title="Data Reliability" icon="shield-check">
+    Implementing Delta Lake for deduplication, schema integrity, and audit trails
+  </Card>
+  <Card title="Multi-Model Delivery" icon="database">
+    Powering OLAP analytics (ClickHouse), Relationship Mapping (Neo4j), and AI-driven RAG (Pinecone) from a single unified pipeline
+  </Card>
+</CardGroup>
+
+## Platform Features
+
+### High-Throughput Stream Processing
+
+Leverages Spark Structured Streaming to ingest and validate data from Apache Kafka in real-time.
+
+### Fault-Tolerant Ingestion (DLQ)
+
+Features a built-in "Lightweight Parsing" mechanism. If critical fields cannot be parsed due to schema evolution or corruption, records are routed to a Dead Letter Queue (DLQ) on MinIO instead of halting the entire pipeline.
+
+<Note>
+The DLQ ensures 24/7 availability by preventing bad records from stopping the entire streaming pipeline.
+</Note>
+
+### Structured Medallion Architecture
+
+<Steps>
+  <Step title="Bronze Layer">
+    Immutable raw data storage for auditing and re-processing
+  </Step>
+  <Step title="Silver Layer">
+    Cleaned and deduplicated data using Delta Lake's Upsert (Merge) logic, ensuring a "Single Source of Truth"
+  </Step>
+  <Step title="Gold Layer">
+    Business-ready tables optimized for specific query patterns
+  </Step>
+</Steps>
+
+### Real-time Analytics Ready
+
+Fully integrated with ClickHouse to provide ultra-fast OLAP capabilities for statistical reporting and interactive dashboards.
+
+### Relationship Exploration (Knowledge Graph)
+
+Synchronizes refined data to Neo4j, enabling deep-link traversal between Movies, TV Shows, and their respective Cast and Crew.
+
+### Semantic Search & RAG Support
+
+Encodes and stores data in Pinecone vector database, providing the foundation for AI-powered recommendation systems and Retrieval-Augmented Generation (RAG).
+
+### Change-Driven Sync Logic
+
+A sophisticated batch refinement process that detects changes in relationship or embedding-related fields. It ensures that downstream updates (Neo4j/Pinecone) only occur when data has actually changed, drastically reducing overhead.
+
+<Tip>
+The change-tracking mechanism significantly reduces API costs and write latency by only updating records that have actually changed.
+</Tip>
+
+### Production-Ready Deployment
+
+Seamlessly transitions from local development to scale-out production using Docker Compose and Kubernetes (K8s) manifests.
+
+## Technology Stack
+
+The platform leverages industry-leading technologies across multiple categories:
+
+| Category | Technologies |
+| :--- | :--- |
+| **Languages** | Python 3.10, SQL |
+| **Data Ingestion** | Apache Kafka, Apache Spark |
+| **Orchestration** | Apache Airflow |
+| **Storage & Delta** | Delta Lake, MinIO |
+| **Databases** | ClickHouse, Neo4j, Pinecone |
+| **Infrastructure** | Docker, Kubernetes |
+
+## Use Cases
+
+The Entertainment Data Platform supports a variety of analytical and operational use cases:
+
+<CardGroup cols={2}>
+  <Card title="Interactive Dashboards" icon="chart-line">
+    Power real-time analytics dashboards with ClickHouse's OLAP capabilities
+  </Card>
+  <Card title="Content Recommendations" icon="stars">
+    Build AI-powered recommendation systems using Pinecone vector search
+  </Card>
+  <Card title="Relationship Analysis" icon="diagram-project">
+    Explore complex relationships between movies, shows, and people using Neo4j graph queries
+  </Card>
+  <Card title="Data Audit Trails" icon="clock-rotate-left">
+    Maintain complete audit trails with immutable Bronze layer storage
+  </Card>
+</CardGroup>
+
+## Data Sources
+
+The platform processes data from The Movie Database (TMDB) API, including:
+
+- **Movies**: Complete movie metadata, cast, crew, and production details
+- **TV Series**: Television show information, seasons, episodes, and credits
+- **People**: Actor, director, and crew member biographies and filmographies
+
+<Info>
+Example datasets are available on [Kaggle](https://www.kaggle.com/datasets/khoatm2k4/tmdb-craw-dataset) and [HuggingFace](https://huggingface.co/datasets/tmkhoa/tmdb-craw-dataset/tree/main).
+</Info>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    Understand the system architecture and data flow
+  </Card>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Get started with installation and setup
+  </Card>
+</CardGroup>

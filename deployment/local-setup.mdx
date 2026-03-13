@@ -1,0 +1,337 @@
+---
+title: Local Development Setup
+description: Set up the Entertainment Data Platform for local development
+---
+
+This guide walks you through setting up the complete Entertainment Data Platform on your local machine for development and testing purposes.
+
+## Prerequisites
+
+Before starting, ensure your development environment meets the following requirements:
+
+<CardGroup cols={2}>
+  <Card title="Operating System" icon="laptop">
+    Linux environment (Ubuntu 20.04+ or similar)
+  </Card>
+  <Card title="Java Runtime" icon="coffee">
+    Java 17 or later
+  </Card>
+  <Card title="Python" icon="python">
+    Python 3.10 or later
+  </Card>
+  <Card title="Docker" icon="docker">
+    Docker 20.10+ and Docker Compose 2.0+
+  </Card>
+</CardGroup>
+
+<Note>
+  The platform has been tested on Linux environments. While it may work on macOS or Windows with WSL2, Linux is the recommended development environment.
+</Note>
+
+## Architecture Overview
+
+The local setup includes the following infrastructure components:
+
+- **Apache Kafka**: Message broker for event streaming (port 9092)
+- **MinIO**: S3-compatible object storage for Delta Lake (ports 9000, 9001)
+- **ClickHouse**: OLAP database for analytics (ports 8123, 9002)
+- **Redis**: In-memory cache and state management (port 6379)
+- **Tabix**: Web UI for ClickHouse queries (port 8081)
+
+## Installation Steps
+
+<Steps>
+  <Step title="Clone the Repository">
+    Clone the project repository to your local machine:
+
+    ```bash
+    git clone <repository-url>
+    cd entertainment-data-platform
+    ```
+  </Step>
+
+  <Step title="Install Python Dependencies">
+    Install the required Python packages using pip:
+
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+    Key dependencies include:
+    - `pyspark==3.5.1` - Apache Spark for stream processing
+    - `delta-spark==3.2.0` - Delta Lake integration
+    - `confluent-kafka` - Kafka producer/consumer
+    - `clickhouse-connect` - ClickHouse database driver
+    - `minio` - MinIO client library
+    - `redis` - Redis client
+    - `sentence-transformers` - For vector embeddings
+  </Step>
+
+  <Step title="Start Infrastructure Services">
+    Navigate to the Docker deployment directory and start all infrastructure services:
+
+    ```bash
+    cd deployment/docker
+    docker compose -f docker_compose.yml up -d
+    ```
+
+    This command starts all required services in detached mode. The infrastructure includes:
+
+    <Accordion title="Kafka Configuration">
+      - **Image**: `apache/kafka:latest`
+      - **Broker ID**: 1
+      - **Replication Factor**: 1 (suitable for local development)
+      - **Partitions**: 3
+      - **Retention**: 2.5 hours (9000000 ms)
+      - **Auto Topic Creation**: Enabled
+    </Accordion>
+
+    <Accordion title="MinIO Configuration">
+      - **Image**: `minio/minio`
+      - **Root User**: `minio`
+      - **Root Password**: `minio123`
+      - **API Port**: 9000
+      - **Console Port**: 9001
+    </Accordion>
+
+    <Accordion title="ClickHouse Configuration">
+      - **Image**: `clickhouse/clickhouse-server`
+      - **HTTP Port**: 8123
+      - **Native Port**: 9002
+      - **Access Management**: Enabled
+    </Accordion>
+
+    <Accordion title="Redis Configuration">
+      - **Image**: `redis:8.2.1-alpine`
+      - **Port**: 6379
+    </Accordion>
+  </Step>
+
+  <Step title="Verify Services are Running">
+    Check that all containers are up and healthy:
+
+    ```bash
+    docker compose ps
+    ```
+
+    You should see all services in the "Up" state. Expected output:
+
+    ```
+    NAME         IMAGE                                    STATUS
+    broker1      apache/kafka:latest                      Up
+    clickhouse   clickhouse/clickhouse-server             Up
+    minio        minio/minio                              Up
+    redis        redis:8.2.1-alpine                       Up
+    tabix        spoonest/clickhouse-tabix-web-client     Up
+    ```
+  </Step>
+
+  <Step title="Set Python Path">
+    Set the `PYTHONPATH` environment variable to include the source directory:
+
+    ```bash
+    export PYTHONPATH=$(pwd)/src
+    ```
+
+    <Tip>
+      Add this line to your `~/.bashrc` or `~/.zshrc` to make it permanent:
+      ```bash
+      echo 'export PYTHONPATH="/path/to/entertainment-data-platform/src"' >> ~/.bashrc
+      ```
+    </Tip>
+  </Step>
+</Steps>
+
+## Running the Platform
+
+Once the infrastructure is running, start the platform components in the following order:
+
+### 1. Start Data Ingestion
+
+The ingestion service produces events to Kafka, simulating real-world data streams:
+
+```bash
+python -m ingestion.main
+```
+
+This component:
+- Loads shuffled records from datasets
+- Produces events to Kafka topics with labels (`old`, `new`, `change`)
+- Simulates late-arriving data and updates
+
+### 2. Start Stream Processor
+
+The stream processor consumes from Kafka and writes to the Bronze layer:
+
+```bash
+python -m stream_processor.main
+```
+
+This component:
+- Consumes events from Kafka using Spark Structured Streaming
+- Performs lightweight parsing and validation
+- Routes failed records to Dead Letter Queue (DLQ)
+- Writes raw data to Delta Lake on MinIO (Bronze layer)
+
+### 3. Run Batch Pipelines
+
+Execute the batch jobs sequentially to process data through the medallion architecture:
+
+<Steps>
+  <Step title="Bronze to Silver (Deduplication)">
+    ```bash
+    python -m batch_jobs.pipelines.bronze_silver.minio_to_minio
+    ```
+
+    This step:
+    - Deduplicates records using Delta Lake merge operations
+    - Tracks changes in relationship and embedding fields
+    - Creates the Silver layer (Single Source of Truth)
+  </Step>
+
+  <Step title="Silver to ClickHouse (Analytics)">
+    ```bash
+    python -m batch_jobs.pipelines.silver_silver.minio_to_clickhouse
+    ```
+
+    This step:
+    - Normalizes data into structured tables
+    - Loads data into ClickHouse for OLAP queries
+    - Creates Movies, TV Shows, Casts, and Crews tables
+  </Step>
+
+  <Step title="ClickHouse to Neo4j (Knowledge Graph)">
+    ```bash
+    python -m batch_jobs.pipelines.silver_gold.clickhouse_to_neo4j
+    ```
+
+    This step:
+    - Syncs data to Neo4j graph database
+    - Creates relationships between Movies, TV Shows, and People
+    - Only updates records with relationship changes
+  </Step>
+
+  <Step title="ClickHouse to Pinecone (Vector DB)">
+    ```bash
+    python -m batch_jobs.pipelines.silver_gold.clickhouse_to_pinecone
+    ```
+
+    This step:
+    - Generates embeddings using sentence-transformers
+    - Syncs vectors to Pinecone for semantic search
+    - Only updates records with content changes
+  </Step>
+</Steps>
+
+## Access Web Interfaces
+
+Once everything is running, you can access the following web interfaces:
+
+<CardGroup cols={2}>
+  <Card title="MinIO Console" icon="database" href="http://localhost:9001">
+    Object storage web UI
+    - Username: `minio`
+    - Password: `minio123`
+  </Card>
+  <Card title="Tabix (ClickHouse UI)" icon="table" href="http://localhost:8081">
+    Query ClickHouse data
+    - Connect to: `http://localhost:8123`
+  </Card>
+</CardGroup>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Kafka Connection Refused">
+    If you see connection errors to Kafka:
+
+    1. Check if Kafka is healthy:
+       ```bash
+       docker compose logs broker1
+       ```
+
+    2. Wait for Kafka to complete startup (can take 30-60 seconds)
+
+    3. Verify port 9092 is accessible:
+       ```bash
+       nc -zv localhost 9092
+       ```
+  </Accordion>
+
+  <Accordion title="MinIO Access Issues">
+    If you cannot connect to MinIO:
+
+    1. Check container logs:
+       ```bash
+       docker compose logs minio
+       ```
+
+    2. Verify credentials in your application config match:
+       - User: `minio`
+       - Password: `minio123`
+
+    3. Ensure ports 9000 and 9001 are not in use by other applications
+  </Accordion>
+
+  <Accordion title="Python Module Not Found">
+    If you see `ModuleNotFoundError`:
+
+    1. Verify `PYTHONPATH` is set correctly:
+       ```bash
+       echo $PYTHONPATH
+       ```
+
+    2. Ensure you're running from the project root directory
+
+    3. Reinstall dependencies:
+       ```bash
+       pip install -r requirements.txt
+       ```
+  </Accordion>
+
+  <Accordion title="Docker Compose Issues">
+    If containers fail to start:
+
+    1. Check Docker daemon is running:
+       ```bash
+       docker info
+       ```
+
+    2. View detailed logs:
+       ```bash
+       docker compose logs
+       ```
+
+    3. Remove containers and restart:
+       ```bash
+       docker compose down -v
+       docker compose up -d
+       ```
+  </Accordion>
+</AccordionGroup>
+
+## Stopping the Platform
+
+To stop all services:
+
+```bash
+cd deployment/docker
+docker compose down
+```
+
+<Warning>
+  Using `docker compose down -v` will also remove all volumes and data. Use this flag only when you want a clean slate.
+</Warning>
+
+To stop individual Python processes, use `Ctrl+C` in their respective terminal windows.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Docker Deployment" icon="docker" href="/deployment/docker">
+    Learn about containerized deployment
+  </Card>
+  <Card title="Kubernetes Deployment" icon="kubernetes" href="/deployment/kubernetes">
+    Deploy to production with Kubernetes
+  </Card>
+</CardGroup>

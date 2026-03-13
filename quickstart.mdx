@@ -1,80 +1,392 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quick Start
+description: Get the Entertainment Data Platform up and running in minutes
 ---
 
-## Get started in three steps
+## Prerequisites
 
-Get your documentation site running locally and make your first customization.
-
-### Step 1: Set up your local environment
-
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
-
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
-
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 3: Go live
-
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
-
-## Next steps
-
-Now that you have your docs running, explore these key features:
+Before you begin, ensure your environment meets these requirements:
 
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Operating System" icon="linux">
+    Linux environment (Ubuntu 20.04+ recommended)
+  </Card>
+  <Card title="Java" icon="java">
+    Java 17 (required for Spark)
+  </Card>
+  <Card title="Python" icon="python">
+    Python 3.10
+  </Card>
+  <Card title="Container Runtime" icon="docker">
+    Docker & Docker Compose
+  </Card>
 </CardGroup>
 
+<Warning>
+The platform requires significant system resources. Ensure you have at least:
+- **8 GB RAM** for local development
+- **20 GB disk space** for data and container images
+</Warning>
+
+## Installation
+
+### Step 1: Clone the Repository
+
+First, clone the project repository and navigate to the source directory:
+
+```bash
+git clone <repository-url>
+cd entertainment-data-platform
+```
+
+### Step 2: Install Python Dependencies
+
+Install all required Python packages using pip:
+
+```bash
+pip install -r requirements.txt
+```
+
+**Key Dependencies:**
+
+- `pyspark==3.5.1` - Apache Spark for distributed processing
+- `delta-spark==3.2.0` - Delta Lake integration
+- `confluent-kafka` - Kafka producer/consumer
+- `clickhouse-connect` - ClickHouse database client
+- `sentence-transformers` - Text embedding generation
+- `minio` - MinIO object storage client
+
+<Info>
+For Airflow installation, use: `pip install "apache-airflow==3.1.7" --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-3.1.7/constraints-3.10.txt"`
+</Info>
+
+### Step 3: Verify Java Installation
+
+Spark requires Java 17. Verify your installation:
+
+```bash
+java -version
+```
+
+Expected output should show Java version 17.x.x.
+
+## Start Infrastructure Services
+
+The platform relies on several infrastructure services that run in Docker containers.
+
+### Start All Services
+
+Navigate to the Docker deployment directory and start the services:
+
+```bash
+cd deployment/docker
+docker compose -f docker_compose.yml up -d
+```
+
+This command starts:
+
+- **Kafka Broker** (port 9092) - Message streaming
+- **MinIO** (ports 9000, 9001) - Object storage
+- **ClickHouse** (ports 8123, 9002) - Analytical database
+- **Redis** (port 6379) - State management
+- **Tabix** (port 8081) - ClickHouse web UI
+
+### Verify Services are Running
+
+Check that all containers are healthy:
+
+```bash
+docker compose ps
+```
+
+All services should show status `Up` or `Up (healthy)`.
+
+<Tip>
+Access the MinIO console at `http://localhost:9001` with credentials:
+- **Username**: `minio`
+- **Password**: `minio123`
+</Tip>
+
+## Set Up Python Path
+
+For all Python modules to work correctly, set the `PYTHONPATH` environment variable to include the `src` directory:
+
+```bash
+export PYTHONPATH=$(pwd)/src
+```
+
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+Run this command from the project root directory. You'll need to set this variable in each new terminal session, or add it to your `.bashrc` or `.zshrc` file.
 </Note>
+
+## Run the Data Pipeline
+
+Now you're ready to run the complete data pipeline. Execute these steps in order:
+
+### Step 1: Ingest Data to Kafka
+
+The ingestion module loads sample data and publishes it to Kafka topics:
+
+```bash
+python -m ingestion.main
+```
+
+**What this does:**
+
+<Steps>
+  <Step title="Load Data">
+    Reads JSONL files from `src/ingestion/data/` directory
+  </Step>
+  <Step title="Enrich Records">
+    Adds metadata and timestamps to each record
+  </Step>
+  <Step title="Publish to Kafka">
+    Sends records to appropriate Kafka topics (`movie`, `tv_series`, `person`)
+  </Step>
+</Steps>
+
+You should see log output showing records being processed and sent to Kafka.
+
+### Step 2: Start Stream Processing
+
+The stream processor consumes Kafka events and writes them to Delta Lake (Bronze layer):
+
+```bash
+python -m stream_processor.main
+```
+
+**What this does:**
+
+- Creates a Spark Structured Streaming job
+- Consumes from all Kafka topics
+- Performs lightweight validation
+- Writes valid records to Delta tables on MinIO
+- Routes invalid records to Dead Letter Queue (DLQ)
+
+<Warning>
+This is a long-running process. It will continue streaming until you stop it with `Ctrl+C`. Keep it running in a separate terminal.
+</Warning>
+
+### Step 3: Run Batch Processing Pipeline
+
+After streaming data has been ingested, run the batch jobs to refine and distribute the data.
+
+#### 3.1 Bronze to Silver (Deduplication)
+
+Deduplicate records and track changes:
+
+```bash
+python -m batch_jobs.pipelines.bronze_silver.minio_to_minio
+```
+
+**What this does:**
+
+- Reads Bronze Delta tables
+- Applies full schema parsing
+- Deduplicates based on timestamp
+- Detects changes in relationship and embedding fields
+- Writes to Silver Delta tables
+
+#### 3.2 Silver to ClickHouse (Analytics Layer)
+
+Load structured data into ClickHouse:
+
+```bash
+python -m batch_jobs.pipelines.silver_silver.minio_to_clickhouse
+```
+
+**What this does:**
+
+- Reads Silver Delta tables
+- Transforms data into normalized tables
+- Creates ClickHouse tables if they don't exist
+- Loads data using bulk insert for performance
+
+<Info>
+After this step, you can query the data in ClickHouse using the Tabix UI at `http://localhost:8081`.
+</Info>
+
+#### 3.3 ClickHouse to Neo4j (Knowledge Graph)
+
+<Note>
+**Prerequisites**: This step requires Neo4j to be installed and running. If you haven't set up Neo4j, you can skip this step for now.
+</Note>
+
+Sync relationship data to Neo4j:
+
+```bash
+python -m batch_jobs.pipelines.silver_gold.clickhouse_to_neo4j
+```
+
+**What this does:**
+
+- Queries ClickHouse for records with relationship changes
+- Creates nodes for Movies, TV Series, and People
+- Creates edges for Cast and Crew relationships
+
+#### 3.4 ClickHouse to Pinecone (Vector Database)
+
+<Note>
+**Prerequisites**: This step requires a Pinecone API key and index. If you haven't set up Pinecone, you can skip this step for now.
+</Note>
+
+Generate and sync embeddings:
+
+```bash
+python -m batch_jobs.pipelines.silver_gold.clickhouse_to_pinecone
+```
+
+**What this does:**
+
+- Queries ClickHouse for records with content changes
+- Generates text embeddings using sentence-transformers
+- Upserts vectors to Pinecone index
+
+## Verify Your Setup
+
+After running the pipeline, verify that data has been processed correctly:
+
+### Check Delta Lake Tables
+
+List the buckets and tables in MinIO:
+
+```bash
+python -m stream_processor.read_delta
+```
+
+This utility script will show the available Delta tables and their record counts.
+
+### Query ClickHouse
+
+Access the Tabix web UI at `http://localhost:8081` and run a test query:
+
+```sql
+SELECT data_type, COUNT(*) as count
+FROM movies
+GROUP BY data_type;
+```
+
+You should see counts for movies, TV series, and people records.
+
+### Check Kafka Topics
+
+Verify that Kafka topics were created and contain messages:
+
+```bash
+docker exec -it broker1 kafka-topics --bootstrap-server localhost:9092 --list
+```
+
+You should see topics: `movie`, `tv_series`, and `person`.
+
+## Common Issues and Solutions
+
+<AccordionGroup>
+  <Accordion title="Port Already in Use">
+    If you see errors about ports already being in use, check if services are already running:
+    
+    ```bash
+    docker compose down
+    docker compose up -d
+    ```
+  </Accordion>
+  
+  <Accordion title="Java Not Found">
+    Ensure Java 17 is installed and in your PATH:
+    
+    ```bash
+    export JAVA_HOME=/path/to/java17
+    export PATH=$JAVA_HOME/bin:$PATH
+    ```
+  </Accordion>
+  
+  <Accordion title="Module Not Found Error">
+    Make sure PYTHONPATH is set correctly:
+    
+    ```bash
+    export PYTHONPATH=$(pwd)/src
+    ```
+    
+    Run this from the project root directory.
+  </Accordion>
+  
+  <Accordion title="Kafka Connection Timeout">
+    Wait for Kafka to fully start (can take 30-60 seconds). Check container health:
+    
+    ```bash
+    docker compose ps
+    ```
+    
+    If the broker is unhealthy, restart it:
+    
+    ```bash
+    docker compose restart broker1
+    ```
+  </Accordion>
+  
+  <Accordion title="Out of Memory Errors">
+    Spark requires significant memory. Increase Docker's memory limit in Docker Desktop settings or configure Spark to use less memory in the configuration files.
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+Now that you have the platform running, explore these areas:
+
+<CardGroup cols={2}>
+  <Card title="Architecture Deep Dive" icon="sitemap" href="/architecture">
+    Learn about the Medallion Architecture and component interactions
+  </Card>
+  <Card title="Configuration" icon="gear" href="/operations/configuration">
+    Customize settings for your environment
+  </Card>
+  <Card title="Data Pipelines" icon="diagram-project" href="/concepts/medallion-architecture">
+    Understand each pipeline stage in detail
+  </Card>
+  <Card title="Deployment" icon="rocket" href="/deployment">
+    Deploy to production with Kubernetes
+  </Card>
+</CardGroup>
+
+## Development Workflow
+
+For ongoing development, follow this workflow:
+
+<Steps>
+  <Step title="Start Infrastructure">
+    ```bash
+    cd deployment/docker
+    docker compose up -d
+    ```
+  </Step>
+  
+  <Step title="Set Python Path">
+    ```bash
+    export PYTHONPATH=$(pwd)/src
+    ```
+  </Step>
+  
+  <Step title="Run Ingestion" icon="database">
+    ```bash
+    python -m ingestion.main
+    ```
+  </Step>
+  
+  <Step title="Start Stream Processor" icon="stream">
+    ```bash
+    python -m stream_processor.main
+    ```
+    Keep this running in a separate terminal.
+  </Step>
+  
+  <Step title="Run Batch Jobs" icon="gears">
+    Execute batch pipelines in order as needed:
+    ```bash
+    python -m batch_jobs.pipelines.bronze_silver.minio_to_minio
+    python -m batch_jobs.pipelines.silver_silver.minio_to_clickhouse
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+Use Apache Airflow to automate batch job execution on a schedule. See the Orchestration documentation for details.
+</Tip>

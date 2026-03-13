@@ -1,0 +1,870 @@
+---
+title: 'Troubleshooting'
+description: 'Common issues and solutions for the Entertainment Data Platform'
+---
+
+## Overview
+
+This guide provides solutions to common operational issues you may encounter when running the Entertainment Data Platform. Issues are organized by component and severity.
+
+## Configuration Issues
+
+### Config File Not Found
+
+**Symptom:**
+```
+ERROR | Config file not found: /app/src/stream_processor/config/config.prod.yml
+FileNotFoundError: Config file not found: /app/src/stream_processor/config/config.prod.yml
+```
+
+**Cause:**  
+The `APP_ENV` environment variable is set to a value for which no corresponding config file exists.
+
+**Solution:**
+
+<Steps>
+  <Step title="Verify APP_ENV value">
+    ```bash
+    echo $APP_ENV
+    # Should output: dev, prod, or another valid environment
+    ```
+  </Step>
+  
+  <Step title="Check available config files">
+    ```bash
+    ls -la src/*/config/config.*.yml
+    # Look for config.dev.yml, config.prod.yml
+    ```
+  </Step>
+  
+  <Step title="Create missing config file or fix APP_ENV">
+    ```bash
+    # Option 1: Set correct environment
+    export APP_ENV=dev
+    
+    # Option 2: Create missing config file
+    cp src/stream_processor/config/config.dev.yml \
+       src/stream_processor/config/config.prod.yml
+    # Then edit config.prod.yml with production values
+    ```
+  </Step>
+</Steps>
+
+### Environment Variable Override Not Working
+
+**Symptom:**  
+Configuration values don't change even after setting environment variables.
+
+**Cause:**  
+Only specific variables are supported for override in the Batch Jobs service (Neo4j and Pinecone credentials).
+
+**Solution:**
+
+<Info>
+Only these environment variables override YAML config:
+- `NEO4J_URI`
+- `NEO4J_USERNAME`
+- `NEO4J_PASSWORD`
+- `NEO4J_DATABASE`
+- `AURA_INSTANCEID`
+- `AURA_INSTANCENAME`
+- `PINECONE_API_KEY`
+- `PINECONE_INDEX_NAME`
+
+All other settings must be changed in the YAML config file.
+</Info>
+
+## Kafka Issues
+
+### Kafka Buffer Full
+
+**Symptom:**
+```
+ERROR | ingestion.producer.kafka_producer | Kafka buffer is full, waiting
+```
+
+**Cause:**  
+The Kafka producer is generating messages faster than the broker can accept them.
+
+**Root Causes:**
+1. Kafka broker is slow or overloaded
+2. Network latency between producer and broker
+3. Producer buffer size is too small
+4. Not enough partitions for the topic
+
+**Solution:**
+
+<Accordion title="Option 1: Increase Producer Buffer">
+```yaml config.dev.yml
+kafka:
+  producer:
+    retries: 3
+    max_buffer: 50  # Increase from 10 to 50
+```
+
+The producer will now batch more records before flushing.
+</Accordion>
+
+<Accordion title="Option 2: Increase Kafka Topic Partitions">
+```bash
+# Check current partition count
+kafka-topics --bootstrap-server localhost:9092 \
+  --describe --topic tmdb.movies.raw
+
+# Increase partitions
+kafka-topics --bootstrap-server localhost:9092 \
+  --alter --topic tmdb.movies.raw --partitions 6
+```
+
+More partitions = higher throughput.
+</Accordion>
+
+<Accordion title="Option 3: Check Kafka Broker Health">
+```bash
+# Check broker logs
+docker logs kafka-broker
+
+# Monitor broker performance
+kafka-run-class kafka.tools.JmxTool \
+  --object-name kafka.server:type=BrokerTopicMetrics,name=MessagesInPerSec
+
+# Check disk space
+df -h /var/lib/kafka/data
+```
+</Accordion>
+
+<Accordion title="Option 4: Add Rate Limiting">
+```python src/ingestion/main.py
+import time
+
+# Add delay between batches
+if record_flush_buffer >= settings.kafka.producer.max_buffer:
+    producer.flush()
+    record_flush_buffer = 0
+    time.sleep(2)  # Increase from 1 to 2 seconds
+```
+</Accordion>
+
+### Failed to Deliver Message
+
+**Symptom:**
+```
+ERROR | Failed to deliver message ... with error Local: Queue full
+```
+
+**Cause:**  
+Kafka broker rejected the message or connection failed.
+
+**Solution:**
+
+<Steps>
+  <Step title="Verify Kafka broker is running">
+    ```bash
+    # Check broker status
+    docker ps | grep kafka
+    
+    # Test connection
+    kafka-broker-api-versions \
+      --bootstrap-server localhost:9092
+    ```
+  </Step>
+  
+  <Step title="Check network connectivity">
+    ```bash
+    # Test broker reachability
+    telnet localhost 9092
+    
+    # Check from container
+    docker exec ingestion-service nc -zv kafka-broker 9092
+    ```
+  </Step>
+  
+  <Step title="Increase producer retries">
+    ```yaml config.dev.yml
+    kafka:
+      producer:
+        retries: 10  # Increase from 3 to 10
+    ```
+  </Step>
+  
+  <Step title="Check broker logs for errors">
+    ```bash
+    docker logs kafka-broker | grep ERROR
+    ```
+  </Step>
+</Steps>
+
+### Kafka Consumer Lag Growing
+
+**Symptom:**  
+Stream processor falls behind Kafka topic, lag keeps increasing.
+
+**Cause:**  
+Processing speed is slower than message production rate.
+
+**Solution:**
+
+<Accordion title="Option 1: Increase Spark Parallelism">
+```python src/stream_processor/main.py
+builder = (
+    SparkSession.builder
+        .appName("KafkaStreamToDelta")
+        .master("local[*]")  # Uses all cores
+        .config("spark.default.parallelism", "8")  # Increase parallelism
+        .config("spark.sql.shuffle.partitions", "8")  # Tune shuffle
+)
+```
+</Accordion>
+
+<Accordion title="Option 2: Increase Kafka maxOffsetsPerTrigger">
+```python
+# In read_kafka_stream function, add:
+.option("maxOffsetsPerTrigger", 10000)  # Process more records per batch
+```
+</Accordion>
+
+<Accordion title="Option 3: Optimize Delta Lake Writes">
+```python
+# Enable optimized writes
+.config("spark.databricks.delta.optimizeWrite.enabled", "true")
+.config("spark.databricks.delta.autoCompact.enabled", "true")
+```
+</Accordion>
+
+## Stream Processing Issues
+
+### Checkpoint Recovery Failure
+
+**Symptom:**  
+Stream fails to start or recover from checkpoint.
+
+**Cause:**  
+Checkpoint directory is corrupted or incompatible after code changes.
+
+**Solution:**
+
+<Warning>
+Deleting checkpoints will cause the stream to reprocess data from the beginning or latest offset. Ensure this is acceptable for your use case.
+</Warning>
+
+<Steps>
+  <Step title="Stop the Stream Processor">
+    ```bash
+    docker stop stream-processor
+    ```
+  </Step>
+  
+  <Step title="Delete corrupted checkpoints">
+    ```bash
+    # Using AWS CLI with MinIO
+    aws s3 rm s3://deltalake/bronze/_checkpoints/ \
+      --recursive \
+      --endpoint-url=http://localhost:9000
+    ```
+  </Step>
+  
+  <Step title="Restart with fresh checkpoint">
+    ```bash
+    docker start stream-processor
+    ```
+  </Step>
+</Steps>
+
+### High Invalid Record Rate
+
+**Symptom:**  
+More than 10% of records are being written to invalid data paths.
+
+**Cause:**  
+Schema validation is failing due to missing or malformed fields.
+
+**Diagnosis:**
+
+```python
+# Query invalid records to find patterns
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+
+invalid_df = spark.read.format("delta").load(
+    "s3a://deltalake/bronze/invalid/movies"
+)
+
+# Check which validations are failing
+invalid_df.select(
+    "data_type",
+    "data_label",
+    "timestamp",
+    "process_timestamp",
+    "id_of_data_type"
+).show(20, truncate=False)
+
+# Count null values per column
+from pyspark.sql.functions import col, sum as _sum, when
+
+null_counts = invalid_df.select([
+    _sum(when(col(c).isNull(), 1).otherwise(0)).alias(c)
+    for c in invalid_df.columns
+])
+null_counts.show()
+```
+
+**Solution:**
+
+<Steps>
+  <Step title="Identify the failing validation">
+    Schema validation checks:
+    - `data_type` is not null
+    - `data_label` is not null  
+    - `timestamp` is not null
+    - `process_timestamp` is not null
+    - At least one of `person_id`, `movie_id`, `tv_series_id` is not null
+  </Step>
+  
+  <Step title="Fix upstream data source">
+    If the ingestion data is missing required fields, fix the data source or add default values during preprocessing:
+    
+    ```python src/ingestion/preprocessor/record_processor.py
+    def enrich_record(record, data_type, data_label):
+        # Ensure required fields exist
+        if "timestamp" not in record:
+            record["timestamp"] = datetime.utcnow().isoformat()
+        
+        return {
+            "data_type": data_type,
+            "data_label": data_label,
+            "timestamp": record["timestamp"],
+            # ... other fields
+        }
+    ```
+  </Step>
+  
+  <Step title="Update schema validation if needed">
+    If business requirements changed, update the validation logic:
+    
+    ```python src/stream_processor/processor/event_processor.py
+    def valid_full_schema(df: DataFrame):
+        return df.withColumn(
+            "valid_schema",
+            col("data_type").isNotNull() &
+            col("data_label").isNotNull() &
+            col("timestamp").isNotNull()
+            # Relax validation if process_timestamp can be null
+        )
+    ```
+  </Step>
+</Steps>
+
+### MinIO Connection Errors
+
+**Symptom:**
+```
+Exception: Failed to connect to MinIO
+```
+
+**Cause:**  
+Stream Processor or Batch Jobs cannot reach MinIO endpoint.
+
+**Solution:**
+
+<Steps>
+  <Step title="Verify MinIO is running">
+    ```bash
+    # Check MinIO container
+    docker ps | grep minio
+    
+    # Test MinIO health endpoint
+    curl http://localhost:9000/minio/health/live
+    ```
+  </Step>
+  
+  <Step title="Check endpoint configuration">
+    ```yaml config.dev.yml
+    sinks:
+      delta_lake:
+        # For Spark (HTTP required)
+        minio_endpoint: "http://localhost:9000"
+        # For MinIO SDK (no protocol)
+        minio_endpoint_sdk: "localhost:9000"
+    ```
+    
+    <Warning>
+    `minio_endpoint` requires `http://` prefix for Spark.  
+    `minio_endpoint_sdk` should NOT include protocol.
+    </Warning>
+  </Step>
+  
+  <Step title="Verify credentials">
+    ```bash
+    # Test MinIO access with credentials
+    docker exec stream-processor python -c "
+    from stream_processor.runtime.minio_client import MinioClient
+    client = MinioClient()
+    print(client.bucket_exists('deltalake'))
+    "
+    ```
+  </Step>
+  
+  <Step title="Check network connectivity">
+    ```bash
+    # If using Docker, verify containers are on same network
+    docker network inspect entertainment-network
+    
+    # Test connectivity from container
+    docker exec stream-processor ping minio
+    ```
+  </Step>
+</Steps>
+
+## Batch Job Issues
+
+### Missing Batch Version in Redis
+
+**Symptom:**
+```
+ERROR | CRITICAL: Last version for dedup_batch_version_movie NOT found in Redis. Aborting pipeline.
+```
+
+**Cause:**  
+The deduplication pipeline hasn't run yet, or Redis lost data.
+
+**Solution:**
+
+<Steps>
+  <Step title="Check if Redis is running">
+    ```bash
+    docker ps | grep redis
+    redis-cli ping
+    ```
+  </Step>
+  
+  <Step title="Verify Redis data persistence">
+    ```bash
+    # Check Redis configuration
+    redis-cli CONFIG GET dir
+    redis-cli CONFIG GET save
+    
+    # Manually trigger save
+    redis-cli SAVE
+    ```
+  </Step>
+  
+  <Step title="Run the deduplication pipeline first">
+    ```bash
+    # The dedup pipeline sets batch versions in Redis
+    python src/batch_jobs/pipelines/bronze_silver/minio_to_minio.py
+    ```
+  </Step>
+  
+  <Step title="Manually set batch version (emergency only)">
+    ```bash
+    # Set initial version
+    redis-cli SET dedup_batch_version_movie 1
+    redis-cli SET dedup_batch_version_tv_series 1
+    redis-cli SET dedup_batch_version_person 1
+    ```
+    
+    <Warning>
+    Only use manual version setting for initial setup. Let the pipeline manage versions in production.
+    </Warning>
+  </Step>
+</Steps>
+
+### ClickHouse Write Failures
+
+**Symptom:**
+```
+ERROR | Error when write to Clickhouse table: silver_layer.movies
+```
+
+**Cause:**  
+Connection failure, schema mismatch, or resource constraints.
+
+**Solution:**
+
+<Accordion title="Option 1: Verify ClickHouse Connection">
+```bash
+# Test connection
+clickhouse-client --host localhost --port 9000 --query "SELECT 1"
+
+# From container
+docker exec batch-jobs python -c "
+from clickhouse_driver import Client
+client = Client(host='localhost')
+print(client.execute('SELECT 1'))
+"
+```
+</Accordion>
+
+<Accordion title="Option 2: Check Table Schema">
+```sql
+-- Show table structure
+DESCRIBE TABLE silver_layer.movies;
+
+-- Check for schema mismatches
+-- Ensure DataFrame columns match ClickHouse table columns
+```
+
+If schema changed, update the table or transformation logic.
+</Accordion>
+
+<Accordion title="Option 3: Increase Batch Size">
+```python
+# Smaller batches may succeed where large ones fail
+.option("batchsize", 10000)  # Reduce from default
+```
+</Accordion>
+
+<Accordion title="Option 4: Check ClickHouse Resources">
+```sql
+-- Check running queries
+SELECT query, elapsed, memory_usage 
+FROM system.processes;
+
+-- Check available memory
+SELECT * FROM system.metrics 
+WHERE metric LIKE '%Memory%';
+
+-- Check disk space
+SELECT * FROM system.disks;
+```
+</Accordion>
+
+### Neo4j Write Failures
+
+**Symptom:**
+```
+ERROR | Error when writing Node to Neo4j with label: Movie
+```
+
+**Cause:**  
+Connection issues, constraint violations, or timeout.
+
+**Solution:**
+
+<Steps>
+  <Step title="Verify Neo4j connection">
+    ```bash
+    # Test connection
+    docker exec batch-jobs python -c "
+    from neo4j import GraphDatabase
+    import os
+    driver = GraphDatabase.driver(
+        os.getenv('NEO4J_URI'),
+        auth=(os.getenv('NEO4J_USERNAME'), os.getenv('NEO4J_PASSWORD'))
+    )
+    driver.verify_connectivity()
+    print('Connected')
+    "
+    ```
+  </Step>
+  
+  <Step title="Check constraint violations">
+    ```cypher
+    // Show all constraints
+    SHOW CONSTRAINTS;
+    
+    // If duplicate key errors occur, check existing data
+    MATCH (m:Movie {id: 12345})
+    RETURN m;
+    ```
+  </Step>
+  
+  <Step title="Reduce batch size">
+    ```yaml config.dev.yml
+    storage:
+      neo4j:
+        batch_size: 5  # Reduce from 10
+    ```
+  </Step>
+  
+  <Step title="Increase timeout (Aura only)">
+    For Neo4j Aura, increase connection timeout:
+    
+    ```python
+    # In Neo4j writer configuration
+    driver = GraphDatabase.driver(
+        uri,
+        auth=(username, password),
+        connection_timeout=30,  # Increase from default
+        max_transaction_retry_time=30
+    )
+    ```
+  </Step>
+</Steps>
+
+### Pinecone Upsert Failures
+
+**Symptom:**  
+Vectors fail to write to Pinecone index.
+
+**Cause:**  
+API key invalid, index doesn't exist, or dimension mismatch.
+
+**Solution:**
+
+<Steps>
+  <Step title="Verify API key">
+    ```bash
+    # Test API key
+    curl -H "Api-Key: $PINECONE_API_KEY" \
+      https://api.pinecone.io/indexes
+    ```
+  </Step>
+  
+  <Step title="Check index exists">
+    ```python
+    from pinecone import Pinecone
+    
+    pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+    indexes = pc.list_indexes()
+    print(indexes)
+    ```
+  </Step>
+  
+  <Step title="Verify vector dimensions">
+    ```python
+    # Check index configuration
+    index = pc.Index(os.getenv("PINECONE_INDEX_NAME"))
+    stats = index.describe_index_stats()
+    print(f"Index dimension: {stats['dimension']}")
+    
+    # Ensure vectors match this dimension
+    ```
+  </Step>
+  
+  <Step title="Check namespace configuration">
+    ```yaml config.dev.yml
+    storage:
+      pinecone:
+        namespace:
+          movie: "movie_namespace"
+          tv_series: "tv_series_namespace"
+          person: "person_namespace"
+    ```
+    
+    Ensure namespaces match your Pinecone index setup.
+  </Step>
+</Steps>
+
+## Schema Evolution Issues
+
+### Schema Mismatch After Updates
+
+**Symptom:**  
+Pipeline fails after updating schema definitions.
+
+**Cause:**  
+Existing data in Delta Lake has old schema, new code expects new schema.
+
+**Solution:**
+
+<Accordion title="Option 1: Add Schema Migration">
+```python
+# Add columns with ALTER TABLE
+from delta.tables import DeltaTable
+
+delta_table = DeltaTable.forPath(spark, "s3a://deltalake/silver/valid/movies")
+
+# Add new column with default value
+delta_table.toDF() \
+    .withColumn("new_column", lit(None).cast(StringType())) \
+    .write.format("delta").mode("overwrite").save(path)
+```
+</Accordion>
+
+<Accordion title="Option 2: Use Schema Merging">
+```python
+# Enable schema evolution
+df.write.format("delta") \
+    .option("mergeSchema", "true") \
+    .mode("append") \
+    .save(path)
+```
+</Accordion>
+
+<Accordion title="Option 3: Reprocess with New Schema">
+```bash
+# Delete existing data (backup first!)
+aws s3 rm s3://deltalake/silver/valid/movies \
+  --recursive \
+  --endpoint-url=http://localhost:9000
+
+# Rerun pipeline with new schema
+python src/batch_jobs/pipelines/bronze_silver/minio_to_minio.py
+```
+</Accordion>
+
+## Performance Issues
+
+### Slow Spark Job Execution
+
+**Symptom:**  
+Batch jobs take hours instead of minutes.
+
+**Diagnosis:**
+
+```bash
+# Check Spark UI at http://localhost:4040
+# Look for:
+# - Skewed stages (one task much slower)
+# - High GC time
+# - Spill to disk
+# - Failed tasks
+```
+
+**Solution:**
+
+<Accordion title="Option 1: Increase Executor Memory">
+```python
+builder = SparkSession.builder \
+    .config("spark.executor.memory", "4g") \
+    .config("spark.driver.memory", "4g")
+```
+</Accordion>
+
+<Accordion title="Option 2: Optimize Partitioning">
+```python
+# Repartition before expensive operations
+df = df.repartition(8, "data_type")
+
+# Coalesce to reduce output files
+df.coalesce(4).write.format("delta").save(path)
+```
+</Accordion>
+
+<Accordion title="Option 3: Enable Adaptive Query Execution">
+```python
+.config("spark.sql.adaptive.enabled", "true")
+.config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+```
+</Accordion>
+
+<Accordion title="Option 4: Optimize Delta Lake">
+```python
+# Compact small files
+from delta.tables import DeltaTable
+
+deltaTable = DeltaTable.forPath(spark, path)
+deltaTable.optimize().executeCompaction()
+
+# Z-order by frequently filtered columns
+deltaTable.optimize().executeZOrderBy("data_type", "timestamp")
+```
+</Accordion>
+
+### Out of Memory Errors
+
+**Symptom:**
+```
+java.lang.OutOfMemoryError: Java heap space
+```
+
+**Solution:**
+
+<Steps>
+  <Step title="Increase JVM heap size">
+    ```bash
+    export SPARK_DRIVER_MEMORY=8g
+    export SPARK_EXECUTOR_MEMORY=8g
+    ```
+  </Step>
+  
+  <Step title="Reduce batch size">
+    ```python
+    # Process data in smaller chunks
+    for batch_version in range(1, max_version + 1):
+        df = reader.read_table_with_filters(
+            filters={"batch_version": batch_version}
+        )
+        # Process smaller DataFrame
+    ```
+  </Step>
+  
+  <Step title="Avoid collecting large results">
+    ```python
+    # DON'T do this:
+    results = df.collect()  # Brings all data to driver
+    
+    # DO this instead:
+    df.write.format("delta").save(path)  # Distributed write
+    ```
+  </Step>
+  
+  <Step title="Use broadcast joins wisely">
+    ```python
+    # Only broadcast small DataFrames (<100MB)
+    from pyspark.sql.functions import broadcast
+    
+    result = large_df.join(
+        broadcast(small_df),
+        on="key"
+    )
+    ```
+  </Step>
+</Steps>
+
+## Data Loss Prevention
+
+<Warning>
+Follow these practices to prevent data loss:
+
+1. **Always backup before destructive operations**
+   ```bash
+   # Backup Delta table
+   aws s3 sync s3://deltalake/silver/valid/movies \
+     s3://deltalake-backup/movies-$(date +%Y%m%d) \
+     --endpoint-url=http://localhost:9000
+   ```
+
+2. **Never delete invalid data without analysis**  
+   Invalid records may contain valuable information about data quality issues.
+
+3. **Use Delta Lake time travel for recovery**
+   ```python
+   # Read previous version
+   df = spark.read.format("delta") \
+       .option("versionAsOf", 5) \
+       .load(path)
+   ```
+
+4. **Monitor Redis persistence**  
+   Ensure Redis saves to disk regularly to prevent version loss.
+
+5. **Test schema changes in dev first**  
+   Always validate schema migrations in development before production.
+</Warning>
+
+## Getting Help
+
+If you can't resolve an issue:
+
+<Steps>
+  <Step title="Check logs thoroughly">
+    Enable DEBUG logging and review full stack traces.
+  </Step>
+  
+  <Step title="Review configuration">
+    Verify all connection strings, credentials, and paths.
+  </Step>
+  
+  <Step title="Test components individually">
+    Isolate the failing component and test in isolation.
+  </Step>
+  
+  <Step title="Consult component documentation">
+    Review docs for Kafka, Spark, Delta Lake, ClickHouse, Neo4j, and Pinecone.
+  </Step>
+</Steps>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Configuration" icon="sliders" href="/operations/configuration">
+    Review configuration options for all components
+  </Card>
+  
+  <Card title="Monitoring" icon="chart-line" href="/operations/monitoring">
+    Set up comprehensive monitoring and alerting
+  </Card>
+</CardGroup>

@@ -1,0 +1,421 @@
+---
+title: 'Ingestion API'
+description: 'API reference for the data ingestion service'
+---
+
+## Overview
+
+The Ingestion service is responsible for loading entertainment data from local files, enriching records with metadata, and publishing them to Kafka topics for downstream processing.
+
+## Core Components
+
+### Main Entry Point
+
+<ParamField path="main" type="function">
+  Main entry point for the ingestion service that orchestrates the entire data loading pipeline.
+
+  **Location**: `src/ingestion/main.py:12`
+
+  **Process Flow**:
+  1. Sets up logging configuration
+  2. Loads application settings
+  3. Initializes Kafka producer
+  4. Iterates through data files (movies, TV series, persons)
+  5. Enriches records with metadata
+  6. Sends records to Kafka topics
+  7. Flushes buffer periodically
+</ParamField>
+
+### Configuration Management
+
+#### Settings Classes
+
+<ResponseField name="Settings" type="BaseModel">
+  Main configuration model for the ingestion service.
+
+  <Expandable title="properties">
+    <ParamField path="kafka" type="KafkaSettings">
+      Kafka-related configuration including topics, server, and producer settings
+    </ParamField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="KafkaSettings" type="BaseModel">
+  Kafka configuration container.
+
+  <Expandable title="properties">
+    <ParamField path="topics" type="TopicSettings">
+      Topic names for different data types
+    </ParamField>
+    <ParamField path="server" type="KafkaServerSettings">
+      Kafka server connection details
+    </ParamField>
+    <ParamField path="producer" type="ProducerSettings">
+      Producer-specific settings
+    </ParamField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="TopicSettings" type="BaseModel">
+  Defines Kafka topic names for each data type.
+
+  <Expandable title="properties">
+    <ParamField path="movie" type="string">
+      Kafka topic for movie data
+    </ParamField>
+    <ParamField path="tv_series" type="string">
+      Kafka topic for TV series data
+    </ParamField>
+    <ParamField path="person" type="string">
+      Kafka topic for person/actor data
+    </ParamField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="ProducerSettings" type="BaseModel">
+  Kafka producer configuration.
+
+  <Expandable title="properties">
+    <ParamField path="retries" type="int">
+      Number of retry attempts for failed sends
+    </ParamField>
+    <ParamField path="max_buffer" type="int">
+      Maximum number of records to buffer before flushing
+    </ParamField>
+  </Expandable>
+</ResponseField>
+
+#### Loading Configuration
+
+<ParamField path="load_settings" type="function" returnType="Settings">
+  Loads configuration from YAML file based on APP_ENV environment variable.
+
+  **Location**: `src/ingestion/config/settings.py:30`
+
+  **Returns**: Validated Settings object
+
+  **Environment Variables**:
+  - `APP_ENV`: Environment name (defaults to "dev")
+
+  **Config File Pattern**: `config.{env}.yml`
+</ParamField>
+
+### File Loading
+
+<ParamField path="iter_full" type="function" returnType="Generator">
+  Round-robin iterator that yields mixed data from all data folders.
+
+  **Location**: `src/ingestion/loader/file_loader.py:39`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="data_root_path" type="Path" required>
+      Root directory containing data files organized by type and label
+    </ParamField>
+  </Expandable>
+
+  **Yields**: Tuple of `(record, data_type, data_label)`
+
+  **Data Types**: `["movie", "tv_series", "person"]`
+
+  **Data Labels**: `["old", "new", "change"]`
+</ParamField>
+
+<ParamField path="iter_records_from_file" type="function" returnType="Generator">
+  Loads and yields JSON records from a single file.
+
+  **Location**: `src/ingestion/loader/file_loader.py:11`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="file_path" type="Path" required>
+      Path to JSONL file to read
+    </ParamField>
+  </Expandable>
+
+  **Yields**: Parsed JSON objects (dict)
+
+  **Error Handling**: Logs errors but continues processing
+</ParamField>
+
+<ParamField path="iter_records_from_folder" type="function" returnType="Generator">
+  Loads records from all JSONL files in a folder.
+
+  **Location**: `src/ingestion/loader/file_loader.py:25`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="data_root_path" type="Path" required>
+      Root data directory
+    </ParamField>
+    <ParamField path="data_type" type="str" required>
+      Type of data (movie, tv_series, person)
+    </ParamField>
+    <ParamField path="data_label" type="str" required>
+      Data label (old, new, change)
+    </ParamField>
+  </Expandable>
+
+  **Yields**: JSON records from all files in the target folder
+</ParamField>
+
+### Record Processing
+
+<ParamField path="enrich_record" type="function" returnType="dict">
+  Adds metadata to records including data type, label, and timestamp.
+
+  **Location**: `src/ingestion/preprocessor/record_processor.py:20`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="record" type="dict" required>
+      Original data record
+    </ParamField>
+    <ParamField path="data_type" type="str" required>
+      Type of data (movie, tv_series, person)
+    </ParamField>
+    <ParamField path="data_label" type="str" required>
+      Data label (old, new, change)
+    </ParamField>
+  </Expandable>
+
+  **Returns**: Enriched record with added fields:
+  - `data_type`: Type identifier
+  - `data_label`: Label identifier
+  - `timestamp`: Random timestamp within appropriate date range
+
+  **Timestamp Ranges**:
+  - **old**: 2025-01-01 to 2025-12-31
+  - **new/change**: 2026-01-01 to 2026-02-20
+</ParamField>
+
+<ParamField path="get_random_timestamp" type="function" returnType="str">
+  Generates random UTC timestamp between start and end dates.
+
+  **Location**: `src/ingestion/preprocessor/record_processor.py:7`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="start" type="datetime" required>
+      Start of time range
+    </ParamField>
+    <ParamField path="end" type="datetime" required>
+      End of time range
+    </ParamField>
+  </Expandable>
+
+  **Returns**: ISO 8601 formatted timestamp string (e.g., "2025-06-15T14:30:00Z")
+</ParamField>
+
+### Kafka Producer
+
+<ResponseField name="KafkaProducerService" type="class">
+  Kafka producer wrapper for sending records to topics.
+
+  **Location**: `src/ingestion/producer/kafka_producer.py:11`
+</ResponseField>
+
+#### Constructor
+
+<ParamField path="__init__" type="method">
+  Initializes Kafka producer with settings.
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="settings" type="Settings" required>
+      Application settings containing Kafka configuration
+    </ParamField>
+  </Expandable>
+
+  **Producer Configuration**:
+  - `bootstrap.servers`: Kafka broker addresses
+  - `client.id`: Hostname of the producer
+  - `retries`: Number of retry attempts
+</ParamField>
+
+#### Methods
+
+<ParamField path="send" type="method">
+  Sends a record to a Kafka topic.
+
+  **Location**: `src/ingestion/producer/kafka_producer.py:35`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="topic" type="str" required>
+      Target Kafka topic name
+    </ParamField>
+    <ParamField path="value" type="dict" required>
+      Record to send (will be JSON serialized)
+    </ParamField>
+  </Expandable>
+
+  **Key Generation**: Random integer (0-10) for partitioning
+
+  **Error Handling**:
+  - BufferError: Waits and retries
+  - General exceptions: Logged but not raised
+</ParamField>
+
+<ParamField path="flush" type="method">
+  Flushes all buffered records to Kafka.
+
+  **Location**: `src/ingestion/producer/kafka_producer.py:57`
+</ParamField>
+
+<ParamField path="close" type="method">
+  Flushes and closes the Kafka producer.
+
+  **Location**: `src/ingestion/producer/kafka_producer.py:65`
+</ParamField>
+
+## Usage Examples
+
+### Running the Ingestion Service
+
+```python
+from ingestion.main import main
+
+# Start the ingestion service
+main()
+```
+
+### Loading Configuration
+
+```python
+from ingestion.config.settings import load_settings
+import os
+
+# Set environment
+os.environ['APP_ENV'] = 'production'
+
+# Load settings
+settings = load_settings()
+print(f"Kafka server: {settings.kafka.server.bootstrap_servers}")
+print(f"Movie topic: {settings.kafka.topics.movie}")
+```
+
+### Using the File Loader
+
+```python
+from pathlib import Path
+from ingestion.loader.file_loader import iter_full
+
+# Iterate through all data files
+data_root = Path("/path/to/data")
+for record, data_type, data_label in iter_full(data_root):
+    print(f"Processing {data_type} ({data_label}): {record.get('id')}")
+```
+
+### Enriching Records
+
+```python
+from ingestion.preprocessor.record_processor import enrich_record
+
+original_record = {
+    "movie_id": 12345,
+    "title": "Example Movie",
+    "overview": "A great film"
+}
+
+enriched = enrich_record(
+    record=original_record,
+    data_type="movie",
+    data_label="new"
+)
+
+print(enriched)
+# Output includes: data_type, data_label, timestamp
+```
+
+### Using Kafka Producer
+
+```python
+from ingestion.producer.kafka_producer import KafkaProducerService
+from ingestion.config.settings import load_settings
+
+settings = load_settings()
+producer = KafkaProducerService(settings)
+
+# Send records
+for i in range(100):
+    record = {"id": i, "name": f"Item {i}"}
+    producer.send(settings.kafka.topics.movie, record)
+    
+    # Flush every 50 records
+    if i % 50 == 0:
+        producer.flush()
+
+# Close producer
+producer.close()
+```
+
+## Configuration Example
+
+```yaml
+# config.dev.yml
+kafka:
+  topics:
+    movie: "movie-events"
+    tv_series: "tv-series-events"
+    person: "person-events"
+  
+  server:
+    bootstrap_servers: "localhost:9092"
+  
+  producer:
+    retries: 3
+    max_buffer: 1000
+```
+
+## Data Flow
+
+<Steps>
+  <Step title="Load Files">
+    `iter_full()` reads JSONL files in round-robin fashion from data folders
+  </Step>
+  
+  <Step title="Enrich Records">
+    `enrich_record()` adds metadata (type, label, timestamp) to each record
+  </Step>
+  
+  <Step title="Send to Kafka">
+    `KafkaProducerService.send()` publishes records to appropriate topics
+  </Step>
+  
+  <Step title="Buffer Management">
+    Records are buffered and flushed periodically based on `max_buffer` setting
+  </Step>
+</Steps>
+
+## Error Handling
+
+<Warning>
+The ingestion service logs errors but continues processing when:
+- Individual records fail to parse
+- Kafka buffer is full (with backpressure)
+- Network issues occur (with retries)
+
+Fatal errors will stop the service and log exception details.
+</Warning>
+
+## Performance Considerations
+
+<Tip>
+- **Buffer Size**: Adjust `max_buffer` based on record size and throughput
+- **Flush Interval**: 1-second delay between flushes prevents overwhelming Kafka
+- **Parallelism**: Currently single-threaded; consider parallel processing for larger datasets
+- **Memory**: Round-robin iteration minimizes memory usage
+</Tip>
+
+## Related APIs
+
+<CardGroup cols={2}>
+  <Card title="Stream Processor" icon="water" href="/api/stream-processor">
+    Consumes Kafka events produced by ingestion
+  </Card>
+  
+  <Card title="Batch Jobs" icon="gears" href="/api/batch-jobs">
+    Processes ingested data in batches
+  </Card>
+</CardGroup>

@@ -1,0 +1,441 @@
+---
+title: "Pinecone"
+description: "Vector database for semantic search and similarity matching across entertainment content"
+---
+
+## Overview
+
+Pinecone serves as the **vector database** in the Entertainment Data Platform, enabling semantic search capabilities across movies and TV series. By storing embeddings of content descriptions, the platform can perform similarity searches like "find movies similar to The Matrix" or "recommend shows based on plot themes."
+
+<Info>
+Vector databases enable semantic search that understands meaning and context, not just keyword matching.
+</Info>
+
+## Architecture
+
+Pinecone receives pre-computed embeddings from ClickHouse data:
+
+```mermaid
+graph LR
+    A[ClickHouse] --> B[Vector Preparation]
+    B --> C[Text Concatenation]
+    C --> D[Sentence Transformers]
+    D --> E[Embeddings]
+    E --> F[Pinecone Index]
+    F --> G[Semantic Search]
+```
+
+### Data Flow
+
+<Steps>
+  <Step title="Read from ClickHouse">
+    Retrieve movie and TV series data with text fields (overview, tagline) using batch version filters.
+  </Step>
+  
+  <Step title="Prepare Vector Documents">
+    Concatenate text fields to create a single document string per entity.
+  </Step>
+  
+  <Step title="Generate Embeddings">
+    Use Sentence Transformers to convert text into dense vector embeddings (typically 768 or 1024 dimensions).
+  </Step>
+  
+  <Step title="Write to Pinecone">
+    Upload vectors with IDs and namespaces to Pinecone index for fast similarity search.
+  </Step>
+</Steps>
+
+## Writer Implementation
+
+The `PineconeWriter` class handles vector uploads:
+
+```python src/batch_jobs/io/writers/pinecone_writer.py
+class PineconeWriter:
+    def __init__(self, spark: SparkSession):
+        self.spark = spark
+        self.settings = load_settings()
+
+    def write_index(self, df: DataFrame):
+        """
+        Write DataFrame to Pinecone index
+        """
+        df.write \
+            .option("pinecone.apiKey", self.settings.storage.pinecone.api_key) \
+            .option("pinecone.indexName", self.settings.storage.pinecone.index_name) \
+            .format("io.pinecone.spark.pinecone.Pinecone") \
+            .mode("append") \
+            .save()
+```
+
+<Tip>
+The Pinecone Spark connector handles batching and retries automatically, ensuring reliable vector uploads at scale.
+</Tip>
+
+## Vector Preparation
+
+Before writing to Pinecone, data must be transformed into the required schema:
+
+### Text Concatenation
+
+Multiple text fields are combined into a single document:
+
+```python src/batch_jobs/tranforms/clickhouse_pinecone/prepare_vector_df.py
+def prepare_vector_col(
+    df: DataFrame,
+    vector_prepare_cols: list[str],
+    vector_col_name: str = "document"
+):
+    """
+    Concatenate columns to create a full vector column
+    """
+    target_df = df.withColumn(vector_col_name, concat_ws(
+        " | ",
+        *[col(c) for c in vector_prepare_cols]
+    ))
+    return target_df
+```
+
+<Note>
+The separator ` | ` helps the embedding model distinguish between different text fields (overview vs. tagline).
+</Note>
+
+### Embedding Generation
+
+The platform uses Sentence Transformers for creating embeddings:
+
+```python src/batch_jobs/tranforms/clickhouse_pinecone/prepare_vector_df.py
+def get_embed_udf(model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+    """
+    Create UDF to embed text into vector
+    """
+    model_holder = {"model": None}
+
+    @pandas_udf(ArrayType(FloatType()))
+    def embed_udf(texts: pd.Series) -> pd.Series:
+        """
+        Embed text column into vector
+        """
+        # Lazy load model once per executor
+        if model_holder["model"] is None:
+            from sentence_transformers import SentenceTransformer
+            model_holder["model"] = SentenceTransformer(model_name)
+
+        embeddings = model_holder["model"].encode(
+            sentences=texts,
+            batch_size=64,
+            normalize_embeddings=True
+        )
+        return pd.Series([e.tolist() for e in embeddings])
+
+    return embed_udf
+```
+
+<Warning>
+Model loading is expensive. The `model_holder` pattern ensures each Spark executor loads the model only once, reusing it across batches.
+</Warning>
+
+### Pinecone Schema
+
+The complete transformation to Pinecone schema:
+
+```python src/batch_jobs/tranforms/clickhouse_pinecone/prepare_vector_df.py
+def prepare_vector_schema(
+    df: DataFrame,
+    id_col: str,
+    namespace: str,
+    vector_prepare_cols: list[str],
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    vector_col_name: str = "document",
+    metadata: str = "None"
+):
+    """
+    Prepare DataFrame with the required schema to write to Pinecone
+    """
+    embed_udf = get_embed_udf(model_name)
+    vector_df = prepare_vector_col(df, vector_prepare_cols, vector_col_name)
+    
+    target_df = vector_df.withColumn("id", col(id_col).cast(StringType())) \
+                    .withColumn("namespace", lit(namespace)) \
+                    .withColumn("values", embed_udf(col(vector_col_name))) \
+                    .withColumn("metadata", lit(metadata)) \
+                    .withColumn("sparse_values", lit(None).cast(SPARSE_SCHEMA)) \
+                    .select("id", "namespace", "values", "metadata", "sparse_values")
+    
+    return target_df
+```
+
+Required Pinecone fields:
+- **id**: Unique identifier (movie_id or tv_series_id as string)
+- **namespace**: Logical grouping (e.g., "movie", "tv_series")
+- **values**: Dense vector embedding (array of floats)
+- **metadata**: Optional JSON metadata (unused in this implementation)
+- **sparse_values**: Optional sparse vector (unused in this implementation)
+
+## Pipeline: ClickHouse to Pinecone
+
+The `clickhouse_to_pinecone` pipeline syncs embeddings:
+
+```python src/batch_jobs/pipelines/silver_gold/clickhouse_to_pinecone.py
+TRANSFORM_MAP = {
+    "movie": {
+        "id_col": "movie_id",
+        "vector_prepare_cols": ["overview", "tagline"],
+        "vector_col_name": "document",
+        "metadata": "{}"
+    },
+    "tv_series": {
+        "id_col": "tv_series_id",
+        "vector_prepare_cols": ["overview", "tagline"],
+        "vector_col_name": "document",
+        "metadata": "{}"
+    },
+}
+
+def write_clickhouse_to_pinecone(transform_map=TRANSFORM_MAP):
+    setup_logging()
+    settings = load_settings()
+    redis_client = RedisClient()
+    
+    # Create Spark session with ClickHouse and Pinecone support
+    builder = create_spark_clickhouse_neo4j_pinecone(
+        app_name=settings.spark.app_name_3, 
+        settings=settings
+    )
+    spark = builder.getOrCreate()
+    spark = prepare_clickhouse_native(spark)
+    
+    clickhouse_reader = ClickHouseReader(spark)
+    pinecone_writer = PineconeWriter(spark)
+    
+    for table_name, config in transform_map.items():
+        logger.info(f"Processing table: {table_name}")
+        
+        # Get batch version from Redis
+        version_key = f"{settings.storage.redis.keys.dedup_batch_version}_{table_name}"
+        last_version = redis_client.get(version_key)
+        
+        # Read from ClickHouse
+        filters = [{"batch_version": int(last_version)}]
+        table_reader = clickhouse_reader.read_table_with_filters(
+            table_name=table_name, 
+            filters=filters
+        )
+        
+        # Prepare vectors
+        vector_df = prepare_vector_schema(
+            df=table_reader,
+            id_col=config["id_col"],
+            namespace=settings.storage.pinecone.namespace.model_dump()[table_name],
+            model_name="intfloat/e5-large-v2",
+            vector_prepare_cols=config["vector_prepare_cols"],
+            vector_col_name=config["vector_col_name"],
+            metadata=config["metadata"]
+        )
+        
+        # Write to Pinecone
+        pinecone_writer.write_index(vector_df)
+        logger.info(f"Finish processing table: {table_name}")
+```
+
+<Info>
+The pipeline uses the `intfloat/e5-large-v2` model, which produces 1024-dimensional embeddings optimized for English text.
+</Info>
+
+## Embedding Models
+
+The platform supports multiple Sentence Transformer models:
+
+<CardGroup cols={2}>
+  <Card title="all-MiniLM-L6-v2" icon="gauge">
+    **Fast, lightweight** (384 dimensions)
+    
+    Good for: Quick prototyping, lower memory requirements
+  </Card>
+  
+  <Card title="intfloat/e5-large-v2" icon="star">
+    **High quality** (1024 dimensions)
+    
+    Good for: Production semantic search, better accuracy
+  </Card>
+</CardGroup>
+
+### Model Selection Criteria
+
+- **Embedding dimension**: Higher dimensions capture more semantic nuance but increase storage and query latency
+- **Inference speed**: Smaller models process text faster, critical for batch jobs
+- **Semantic quality**: Evaluate using downstream search quality metrics
+
+## Namespaces
+
+Pinecone namespaces logically separate different content types:
+
+```python
+settings.storage.pinecone.namespace.movie        # "movie" namespace
+settings.storage.pinecone.namespace.tv_series    # "tv_series" namespace
+```
+
+<Tip>
+Namespaces enable filtering queries to specific content types: "find similar movies" vs. "find similar TV series."
+</Tip>
+
+## Query Operations
+
+Once vectors are loaded, Pinecone supports:
+
+### Similarity Search
+
+Find content similar to a given item:
+
+```python
+# Query by vector
+results = index.query(
+    vector=query_embedding,
+    top_k=10,
+    namespace="movie",
+    include_metadata=True
+)
+```
+
+### Hybrid Search
+
+Combine semantic search with metadata filters:
+
+```python
+# Find similar sci-fi movies released after 2010
+results = index.query(
+    vector=query_embedding,
+    top_k=10,
+    namespace="movie",
+    filter={"genre": "Science Fiction", "release_year": {"$gte": 2010}}
+)
+```
+
+<Note>
+Metadata filtering requires storing additional fields in the `metadata` column during ingestion.
+</Note>
+
+## Performance Optimization
+
+<Steps>
+  <Step title="Batch Encoding">
+    The embedding UDF processes texts in batches of 64 using `batch_size=64` for optimal GPU/CPU utilization.
+  </Step>
+  
+  <Step title="Normalize Embeddings">
+    Setting `normalize_embeddings=True` enables faster cosine similarity via dot product.
+  </Step>
+  
+  <Step title="Lazy Model Loading">
+    Load embedding models once per Spark executor using the `model_holder` pattern.
+  </Step>
+  
+  <Step title="Repartition Data">
+    Ensure data is evenly distributed across Spark partitions before embedding generation.
+  </Step>
+  
+  <Step title="Index Configuration">
+    Choose appropriate Pinecone pod type (s1, p1, p2) based on query latency and throughput requirements.
+  </Step>
+</Steps>
+
+## Use Cases
+
+<CardGroup cols={2}>
+  <Card title="Content Recommendation" icon="thumbs-up">
+    "More like this" features based on plot similarity
+  </Card>
+  
+  <Card title="Semantic Search" icon="magnifying-glass">
+    Search by description: "movies about time travel and paradoxes"
+  </Card>
+  
+  <Card title="Duplicate Detection" icon="copy">
+    Identify near-duplicate content across different metadata
+  </Card>
+  
+  <Card title="Clustering & Classification" icon="object-group">
+    Group similar content for categorization and curation
+  </Card>
+</CardGroup>
+
+## Configuration
+
+Pinecone connection settings:
+
+```python
+settings.storage.pinecone.api_key        # Pinecone API key
+settings.storage.pinecone.index_name     # Target index name
+settings.storage.pinecone.namespace.movie       # Movie namespace
+settings.storage.pinecone.namespace.tv_series   # TV series namespace
+```
+
+## Vector Schema
+
+DataFrame schema before writing to Pinecone:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | StringType | Unique identifier (movie_id or tv_series_id) |
+| `namespace` | StringType | Content type ("movie" or "tv_series") |
+| `values` | ArrayType(FloatType) | Dense embedding vector |
+| `metadata` | StringType | JSON metadata (currently unused) |
+| `sparse_values` | StructType | Sparse vector (currently null) |
+
+## Best Practices
+
+<Steps>
+  <Step title="Choose Appropriate Model">
+    Balance embedding quality with inference speed and storage costs. Use `e5-large-v2` for production.
+  </Step>
+  
+  <Step title="Concatenate Relevant Fields">
+    Include all text fields that capture content meaning (overview, tagline, synopsis).
+  </Step>
+  
+  <Step title="Use Field Separators">
+    Separate concatenated fields with ` | ` to help the model distinguish field boundaries.
+  </Step>
+  
+  <Step title="Normalize Embeddings">
+    Always set `normalize_embeddings=True` for cosine similarity searches.
+  </Step>
+  
+  <Step title="Leverage Namespaces">
+    Separate content types into namespaces for faster, more relevant queries.
+  </Step>
+  
+  <Step title="Monitor Embedding Quality">
+    Evaluate search relevance with human feedback and A/B testing.
+  </Step>
+</Steps>
+
+## Limitations
+
+<Warning>
+**Current Implementation Gaps:**
+
+- Metadata field is empty (`"{}"`) - cannot filter by genre, year, or rating
+- Sparse vectors not utilized - hybrid search not available
+- No incremental deletion - removed content remains in index
+- Fixed model - no A/B testing of embedding models
+</Warning>
+
+## Future Enhancements
+
+- **Rich Metadata**: Include genre, release year, ratings for hybrid search
+- **Sparse + Dense Vectors**: Combine semantic and keyword matching
+- **Deletion Handling**: Track `is_deleted` flag and remove vectors
+- **Multi-Modal Embeddings**: Add image embeddings from posters
+- **Incremental Updates**: Only re-embed changed content based on `vector_info_hash_diff`
+
+## Related Documentation
+
+<CardGroup cols={2}>
+  <Card title="ClickHouse" icon="database" href="/serving/clickhouse">
+    Learn how ClickHouse feeds data to Pinecone
+  </Card>
+  
+  <Card title="Neo4j" icon="diagram-project" href="/serving/neo4j">
+    Compare vector search with graph relationship queries
+  </Card>
+</CardGroup>

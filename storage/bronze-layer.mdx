@@ -1,0 +1,294 @@
+---
+title: 'Bronze Layer'
+description: 'Raw data ingestion layer with immutable event storage and Dead Letter Queue handling'
+icon: 'layer-group'
+---
+
+## Overview
+
+The Bronze Layer serves as the **immutable raw data foundation** of the Entertainment Data Platform. It captures streaming events from Kafka in their near-original form, preserving complete audit trails while implementing fault-tolerant ingestion through a Dead Letter Queue (DLQ) mechanism.
+
+<Info>
+The Bronze Layer prioritizes **availability over strict validation**. Records that fail lightweight parsing are routed to DLQ storage rather than halting the pipeline.
+</Info>
+
+## Purpose and Design Philosophy
+
+The Bronze Layer implements a "store first, validate later" approach optimized for:
+
+- **High-throughput ingestion**: Processing streaming events without blocking
+- **Data preservation**: Maintaining complete history for replay and auditing
+- **Fault tolerance**: Isolating bad records without pipeline disruption
+- **Schema flexibility**: Handling evolving data structures gracefully
+
+## Data Flow
+
+<Steps>
+  <Step title="Kafka Consumption">
+    Spark Structured Streaming consumes events from Kafka topics (movies, tv_series, person)
+  </Step>
+  <Step title="Lightweight Parsing">
+    Only critical fields are validated: `data_type`, `data_label`, `timestamp`, and entity IDs
+  </Step>
+  <Step title="Stream Splitting">
+    Valid and invalid records are separated into two parallel write streams
+  </Step>
+  <Step title="Delta Lake Storage">
+    Both streams write to separate Delta tables on MinIO with ACID guarantees
+  </Step>
+</Steps>
+
+## Lightweight Schema Validation
+
+The Bronze Layer uses a **partial schema** to maximize throughput while catching critical failures:
+
+```python
+PARTIAL_EVENT_SCHEMA = StructType([
+    StructField("data_type", StringType(), True),
+    StructField("data_label", StringType(), True),
+    StructField("timestamp", TimestampType(), True),
+])
+
+ID_SCHEMA = StructType([
+    StructField("person_id", IntegerType(), True),
+    StructField("movie_id", IntegerType(), True),
+    StructField("tv_series_id", IntegerType(), True),
+])
+```
+
+### Validation Logic
+
+Records are marked valid only if all critical fields are present:
+
+```python
+def valid_full_schema(df: DataFrame):
+    """
+    Check valid schema by adding boolean value to Column "valid_schema"
+    """
+    id_info = from_json(col("raw_df"), ID_SCHEMA)
+    return df.withColumn("id_info", id_info) \
+                .withColumn(
+                    "id_of_data_type",
+                    coalesce(col("id_info.person_id"), 
+                            col("id_info.movie_id"), 
+                            col("id_info.tv_series_id"))
+                ) \
+                .withColumn(
+                "valid_schema",
+                col("data_type").isNotNull() &
+                col("data_label").isNotNull() &
+                col("timestamp").isNotNull() &
+                col("process_timestamp").isNotNull() &
+                col("id_of_data_type").isNotNull()
+            ) \
+            .drop("id_info")
+```
+
+<Note>
+The raw JSON payload is preserved in the `raw_df` column, allowing full schema parsing to occur later in the Silver Layer.
+</Note>
+
+## Event Processing Pipeline
+
+The stream processor enriches events with processing metadata before storage:
+
+```python
+def process_event(df: DataFrame) -> DataFrame:
+    """
+    Full logic processing event
+    """
+    raw_df = cast_event(df)
+    enriched_df = enrich_event(raw_df)
+    validated_df = valid_full_schema(enriched_df)
+    return validated_df
+
+def enrich_event(df: DataFrame):
+    """
+    Enrich event with more information: process_timestamp, ...
+    """
+    enriched_df = df.withColumn("process_timestamp", current_timestamp())
+    return enriched_df.select(
+        "process_timestamp",
+        *[c for c in enriched_df.columns if c != "process_timestamp"]
+    )
+```
+
+## Dead Letter Queue (DLQ)
+
+Invalid records are routed to separate Delta tables for later inspection and replay:
+
+```python
+def split_valid_invalid_stream(df: DataFrame):
+    """
+    Split to 2 DataFrames by "valid_schema" column.
+    """
+    valid_df = df.filter(col("valid_schema") == True).drop("valid_schema")
+    invalid_df = df.filter(col("valid_schema") == False)
+    return valid_df, invalid_df
+
+def delta_lake_sink_dql(
+        df: DataFrame,
+        valid_table: str,
+        invalid_table: str,
+        valid_checkpoint: str,
+        invalid_checkpoint: str
+):
+    """
+    Create 2 write streams to Delta Lake, one for valid events 
+    and another for invalid events.
+    """
+    valid_df, invalid_df = split_valid_invalid_stream(df)
+    
+    valid_query = delta_lake_sink(valid_df, valid_table, valid_checkpoint)
+    invalid_query = delta_lake_sink(invalid_df, invalid_table, invalid_checkpoint)
+    
+    return valid_query, invalid_query
+```
+
+### DLQ Benefits
+
+<CardGroup cols={2}>
+  <Card title="No Data Loss" icon="shield-check">
+    Failed records are preserved for debugging and reprocessing
+  </Card>
+  <Card title="Pipeline Stability" icon="heart-pulse">
+    Bad records don't halt the entire ingestion flow
+  </Card>
+  <Card title="Audit Trail" icon="clock-rotate-left">
+    Complete history of validation failures for troubleshooting
+  </Card>
+  <Card title="Easy Replay" icon="rotate-right">
+    DLQ records can be fixed and reingested after schema corrections
+  </Card>
+</CardGroup>
+
+## Delta Lake Writing
+
+Events are written using Spark Structured Streaming with Delta Lake format:
+
+```python
+def delta_lake_sink(
+    df: DataFrame,
+    table: str,
+    checkpoint: str
+):
+    """
+    Create a single write stream to Delta Lake.
+    """
+    def log_batch(batch_df, batch_id):
+        logger.info("Batch %s count=%s", batch_id, batch_df.count())
+        batch_df.write \
+            .format("delta") \
+            .mode("append") \
+            .save(table)
+        batch_df.show(truncate=False)
+
+    return (
+        df.writeStream \
+            .format("delta") \
+            .outputMode("append") \
+            .option("checkpointLocation", checkpoint) \
+            .foreachBatch(log_batch)
+            .start(table)
+    )
+```
+
+<Warning>
+Checkpoint locations must be configured correctly to enable exactly-once processing semantics and fault recovery.
+</Warning>
+
+## Storage Organization
+
+Bronze Layer data is organized by entity type on MinIO:
+
+```
+s3://bucket/bronze/
+├── movies/
+│   ├── valid/          # Successfully parsed movie events
+│   └── invalid/        # DLQ for failed movie events
+├── tv_series/
+│   ├── valid/          # Successfully parsed TV series events
+│   └── invalid/        # DLQ for failed TV series events
+└── person/
+    ├── valid/          # Successfully parsed person events
+    └── invalid/        # DLQ for failed person events
+```
+
+## Key Characteristics
+
+<CardGroup cols={2}>
+  <Card title="Immutable" icon="lock">
+    Records are append-only, never updated or deleted
+  </Card>
+  <Card title="Complete" icon="database">
+    Full raw JSON payload preserved for reprocessing
+  </Card>
+  <Card title="Timestamped" icon="clock">
+    Both event timestamp and processing timestamp recorded
+  </Card>
+  <Card title="Partitioned" icon="folder-tree">
+    Organized by data type for efficient downstream processing
+  </Card>
+</CardGroup>
+
+## Configuration
+
+Bronze Layer settings from `stream_processor/config/settings.py`:
+
+```yaml
+sinks:
+  delta_lake:
+    minio_endpoint: "http://minio:9000"
+    core_bucket: "entertainment-data"
+    tables:
+      valid_base_path: "s3a://entertainment-data/bronze"
+      invalid_base_path: "s3a://entertainment-data/bronze-dlq"
+    checkpoints:
+      valid_base_path: "s3a://entertainment-data/checkpoints/bronze"
+      invalid_base_path: "s3a://entertainment-data/checkpoints/bronze-dlq"
+```
+
+## Performance Considerations
+
+<Tip>
+**Watermarking**: The stream processor uses configurable watermarks to handle late-arriving data while preventing unbounded state growth.
+</Tip>
+
+### Throughput Optimization
+
+1. **Minimal validation**: Only critical fields checked at ingestion time
+2. **Parallel writes**: Valid and invalid streams write concurrently
+3. **Batch processing**: `foreachBatch` enables optimized Delta writes
+4. **Checkpointing**: Enables fast recovery without reprocessing
+
+## Monitoring and Operations
+
+### Key Metrics to Track
+
+- **DLQ rate**: Percentage of records failing validation
+- **Processing lag**: Time between event timestamp and processing
+- **Throughput**: Records per second processed
+- **Checkpoint age**: Time since last successful checkpoint
+
+### Operational Procedures
+
+<Steps>
+  <Step title="Monitor DLQ volume">
+    Set up alerts for unexpected spikes in invalid record counts
+  </Step>
+  <Step title="Investigate failures">
+    Query DLQ tables to identify schema evolution or data quality issues
+  </Step>
+  <Step title="Fix and replay">
+    After resolving issues, reprocess DLQ records through the pipeline
+  </Step>
+  <Step title="Update schemas">
+    If legitimate schema changes detected, update validation logic accordingly
+  </Step>
+</Steps>
+
+## Next Steps
+
+<Card title="Silver Layer" icon="arrow-right" href="/storage/silver-layer">
+  Learn how Bronze data is deduplicated, fully parsed, and prepared for analytics
+</Card>

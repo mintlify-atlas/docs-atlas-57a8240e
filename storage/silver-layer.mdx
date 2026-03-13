@@ -1,0 +1,521 @@
+---
+title: 'Silver Layer'
+description: 'Cleaned, deduplicated, and change-tracked data with full schema validation'
+icon: 'filter'
+---
+
+## Overview
+
+The Silver Layer transforms raw Bronze data into a **clean, deduplicated, single source of truth**. It implements full schema parsing, timestamp-based deduplication, and sophisticated change tracking to optimize downstream updates to expensive Graph and Vector databases.
+
+<Info>
+The Silver Layer is where data quality is enforced and business logic begins. It serves as the foundation for all analytical and serving layers.
+</Info>
+
+## Purpose and Responsibilities
+
+The Silver Layer bridges the gap between raw ingestion and business-ready data:
+
+- **Full schema parsing**: Complete validation against structured schemas
+- **Deduplication**: Timestamp-based merge to handle late-arriving updates
+- **Change detection**: Track modifications to relationships and embeddings
+- **Single source of truth**: Upsert logic ensures only latest versions exist
+- **Audit trail**: Batch version tracking for incremental processing
+
+## Data Flow
+
+<Steps>
+  <Step title="Change Data Feed (CDF) Read">
+    Read incremental changes from Bronze Delta tables using version-based CDF
+  </Step>
+  <Step title="Batch Deduplication">
+    Within each batch, keep only the latest record per entity based on timestamp
+  </Step>
+  <Step title="Full Schema Parsing">
+    Parse raw JSON against complete entity schemas (Movie, TV Series, Person)
+  </Step>
+  <Step title="Hash Generation">
+    Compute hashes for arrays (casts, crews) and embedding fields (overview, tagline)
+  </Step>
+  <Step title="Change Detection">
+    Compare hashes with existing Silver records to identify modified relationships
+  </Step>
+  <Step title="Delta Merge">
+    Upsert to Silver tables, updating when source timestamp is newer
+  </Step>
+</Steps>
+
+## Bronze to Silver Pipeline
+
+The deduplication and enrichment pipeline from `batch_jobs/pipelines/bronze_silver/minio_to_minio.py`:
+
+```python
+def run_dedup_timestamp():
+    """
+    Pipeline to dedup timestamp, from bronze to silver layer in Delta Lake Minio
+    """
+    spark = builder.getOrCreate()
+    delta_minio_reader = DeltaMinioReader(spark)
+    redis_client = RedisClient()
+    
+    data_struct_schema = {
+        "movie": MOVIE_FULL_SCHEMA,
+        "tv_series": TV_SERIES_FULL_SCHEMA,
+        "person": PERSON_FULL_SCHEMA
+    }
+    
+    for data_type, target_folder in settings.storage.delta_lake.target_name_folder:
+        # Get batch version from Redis
+        version_key = f"{settings.storage.redis.keys.dedup_batch_version}_{data_type}"
+        last_version = redis_client.get(version_key)
+        
+        # Read incremental changes using CDF
+        delta_table = DeltaTable.forPath(spark, from_path)
+        current_version = delta_table.history(1).select("version").collect()[0][0]
+        from_df = delta_minio_reader.read_table_cdf(
+            target_path=from_path, 
+            start_version=int(last_version), 
+            end_version=current_version
+        )
+        from_df = from_df.withColumn("batch_version", lit(current_version))
+        
+        # Upsert with change tracking
+        key_columns = ["data_type", "id_of_data_type"]
+        ts_column = "timestamp"
+        upsert_latest(spark, from_df, data_type, "raw_df", 
+                     data_schema, to_path, key_columns, ts_column)
+        
+        redis_client.set(version_key, current_version)
+```
+
+<Note>
+Redis tracks the last processed version of each Bronze table, enabling incremental processing and preventing redundant work.
+</Note>
+
+## Change Data Feed (CDF)
+
+Delta Lake's Change Data Feed feature enables efficient incremental processing:
+
+```python
+def read_table_cdf(
+        self,
+        target_path: str,
+        start_timestamp: str | None = None,
+        end_timestamp: str | None = None,
+        start_version: int | None = None,
+        end_version: int | None = None
+):
+    """
+    Read table from Delta with Change Data Feed
+    """
+    reader = self.spark.read.format("delta") \
+                    .option("readChangeFeed", "true")
+    
+    if start_timestamp is not None:
+        reader = reader.option("startingTimestamp", start_timestamp)
+    if end_timestamp is not None:
+        reader = reader.option("endingTimestamp", end_timestamp)
+    if start_version is not None:
+        reader = reader.option("startingVersion", start_version)
+    if end_version is not None:
+        reader = reader.option("endingVersion", end_version)
+    
+    return reader.load(target_path)
+```
+
+<Tip>
+CDF allows reading only the changes between two versions, dramatically reducing data volume for incremental batch jobs.
+</Tip>
+
+## Deduplication Logic
+
+Timestamp-based deduplication handles chaotic late-arriving data:
+
+```python
+def dedup_latest_batch(
+        df: DataFrame,
+        key_columns: list[str],
+        ts_column: str
+):
+    """
+    Deduplicate DataFrame by latest timestamp
+    """
+    window = Window.partitionBy(*key_columns).orderBy(col(ts_column).desc())
+    target_df = df.withColumn("row_number", row_number().over(window)) \
+                    .filter(col("row_number") == 1) \
+                    .drop("row_number")
+    return target_df
+```
+
+### Deduplication Process
+
+<Steps>
+  <Step title="Partition by Entity">
+    Group records by `data_type` and entity ID (movie_id, tv_series_id, person_id)
+  </Step>
+  <Step title="Order by Timestamp">
+    Within each partition, sort by event timestamp descending
+  </Step>
+  <Step title="Keep Latest">
+    Select only the first row (most recent) from each partition
+  </Step>
+</Steps>
+
+## Full Schema Parsing
+
+Raw JSON payloads are parsed against complete entity schemas:
+
+```python
+def parse_schema(
+        df: DataFrame,
+        col: str,
+        schema
+):
+    """
+    Parse schema from DataFrame
+    :param df: DataFrame to parse
+    :param col: column need to parse
+    :param schema: data schema
+    :return: Dataframe with parsed column (name = parsed_<col>)
+    """
+    target_col_name = f"parsed_{col}"
+    target_df = df.withColumn(target_col_name, from_json(col, schema)).drop(col)
+    return target_df
+```
+
+Unlike the Bronze Layer's lightweight validation, Silver parsing extracts all nested structures:
+
+- Movie details (title, overview, release date, genres, etc.)
+- Cast information (actors, characters, credits)
+- Crew information (directors, producers, departments)
+- Person details (biography, known_for_department, filmography)
+
+## Change Tracking System
+
+The Silver Layer implements **intelligent change detection** to optimize downstream updates:
+
+### Hash-Based Change Detection
+
+The system computes hashes for two types of changes:
+
+1. **Array changes** (casts, crews): Track additions and removals
+2. **Vector changes** (overview, tagline): Detect embedding-related updates
+
+```python
+HASH_CONFIGS = {
+    "movie": {
+        "array": [
+            {"array_col": "parsed_raw_df.casts_info", 
+             "prefix_target_column_name": "casts", 
+             "id_element_field": "cast_id"},
+            {"array_col": "parsed_raw_df.crews_info", 
+             "prefix_target_column_name": "crews", 
+             "id_element_field": "person_id"},
+        ],
+        "vector_info_cols": ["parsed_raw_df.movie_detail.overview"],
+        "array_prefix": ["casts", "crews"]
+    },
+    "tv_series": {
+        "array": [
+            {"array_col": "parsed_raw_df.casts_info", 
+             "prefix_target_column_name": "casts", 
+             "id_element_field": "cast_id"},
+            {"array_col": "parsed_raw_df.crews_info", 
+             "prefix_target_column_name": "crews", 
+             "id_element_field": "person_id"},
+        ],
+        "vector_info_cols": ["parsed_raw_df.tv_series_detail.overview"],
+        "array_prefix": ["casts", "crews"]
+    },
+    "person": {
+        "array": [],
+        "vector_info_cols": [],
+        "array_prefix": []
+    }
+}
+```
+
+### Array Hashing
+
+For relationship arrays like casts and crews:
+
+```python
+def hash_array(
+        df: DataFrame,
+        configs: list
+):
+    for config in configs:
+        array_col = config["array_col"]
+        prefix_target_column_name = config["prefix_target_column_name"]
+        id_element_field = config["id_element_field"]
+        
+        # Hash each element in the array
+        df = df.withColumn(
+            f"{prefix_target_column_name}{ELEMENTS_HASH_SUFFIX}",
+            transform(
+                col=col(array_col),
+                f=lambda x: struct(
+                    x[id_element_field].alias("id"),
+                    xxhash64(x).alias("hash")
+                )
+            )
+        )
+        
+        # Hash the entire sorted array for comparison
+        df = df.withColumn(
+            f"{prefix_target_column_name}{TOTAL_HASH_SUFFIX}",
+            xxhash64(array_sort(transform(
+                col=col(f"{prefix_target_column_name}{ELEMENTS_HASH_SUFFIX}"), 
+                f=lambda x: x["hash"]
+            )))
+        )
+    
+    return df
+```
+
+### Vector Content Hashing
+
+For embedding-related fields:
+
+```python
+def hash_cols_to_vector_check(
+        df: DataFrame,
+        cols: list[str]
+):
+    if cols is None or len(cols) == 0:
+        return df
+    
+    df = df.withColumn(f"{VECTOR_HASH_COL}", xxhash64(*cols))
+    return df
+```
+
+## Diff Computation
+
+When merging into Silver, the system computes exact changes:
+
+```python
+def get_full_diff_by_hash(
+    source_df: DataFrame,
+    target_df: DataFrame,
+    key_columns: list[str],
+    prefixes: list[str]
+):
+    # Join source with existing target
+    join_df = source_df.alias("s").join(
+        other=target_df.select(*required_cols).alias("t"),
+        on=key_columns,
+        how="left"
+    )
+    
+    # Compute vector content changes
+    vector_diff_col = when(
+        col(f"t.{VECTOR_HASH_COL}").isNull() |
+        (col(f"s.{VECTOR_HASH_COL}" != col(f"t.{VECTOR_HASH_COL}")),
+        lit(True)
+    ).otherwise(lit(False))
+    
+    # Compute array element differences
+    for prefix in prefixes:
+        elements_add = array_except(s_elements_hash, safe_t_elements_hash)
+        elements_remove = array_except(safe_t_elements_hash, s_elements_hash)
+        
+        # Extract only IDs from changed elements
+        ids_add = transform(elements_add, lambda x: x["id"])
+        ids_remove = transform(elements_remove, lambda x: x["id"])
+        
+        diff_col = when(
+            (col(s_total_hash) != col(t_total_hash)) | col(t_total_hash).isNull(),
+            struct(
+                ids_add.alias("added"),
+                ids_remove.alias("removed")
+            )
+        ).otherwise(get_empty_ids_array_struct())
+    
+    return join_df.select(*select_cols)
+```
+
+<Info>
+**Efficiency Gain**: By tracking which specific cast/crew members were added or removed, downstream Neo4j updates only modify affected relationships instead of rebuilding the entire graph.
+</Info>
+
+## Delta Merge (Upsert) Operation
+
+The Silver Layer uses Delta Lake's MERGE command for upserts:
+
+```python
+def upsert_latest(
+        spark: SparkSession,
+        from_df: DataFrame,
+        data_type: str,
+        raw_column: str,
+        data_schema,
+        to_folder: str,
+        key_columns: list[str],
+        ts_column: str
+):
+    # Dedup batch
+    clean_df = dedup_latest_batch(from_df, key_columns, ts_column)
+    
+    # Parse and hash
+    parsed_df = parse_schema(df=clean_df, col=raw_column, schema=data_schema)
+    hashed_df = full_hash_and_pre_diff_columns(parsed_df, HASH_CONFIGS[data_type])
+    
+    # Initialize table if needed
+    if not DeltaTable.isDeltaTable(spark, to_folder):
+        hashed_df.limit(0).write.format("delta").mode("overwrite").save(to_folder)
+    
+    # Compute diffs
+    target_delta_table = DeltaTable.forPath(spark, to_folder)
+    final_source_df = get_full_diff_by_hash(
+        source_df=hashed_df,
+        target_df=target_delta_table.toDF(),
+        key_columns=key_columns,
+        prefixes=HASH_CONFIGS[data_type]["array_prefix"]
+    )
+    
+    # Execute merge
+    merge_condition = " AND ".join([f"t.{col} = s.{col}" for col in key_columns])
+    update_condition = f"s.{ts_column} > t.{ts_column}"
+    
+    (
+        target_delta_table.alias("t")
+            .merge(source=final_source_df.alias("s"), condition=merge_condition)
+            .whenMatchedUpdateAll(condition=update_condition)
+            .whenNotMatchedInsertAll()
+            .execute()
+    )
+```
+
+### Merge Semantics
+
+<CardGroup cols={2}>
+  <Card title="Match + Newer" icon="arrows-rotate">
+    If record exists and source timestamp is newer, update all fields
+  </Card>
+  <Card title="Match + Older" icon="ban">
+    If record exists but source timestamp is older, skip update
+  </Card>
+  <Card title="No Match" icon="plus">
+    If record doesn't exist, insert as new
+  </Card>
+  <Card title="Atomicity" icon="shield">
+    Entire merge operation is ACID-compliant
+  </Card>
+</CardGroup>
+
+## Storage Organization
+
+Silver Layer data on MinIO:
+
+```
+s3://bucket/silver/
+├── movies/
+│   └── delta_table/
+│       ├── _delta_log/
+│       └── *.parquet
+├── tv_series/
+│   └── delta_table/
+│       ├── _delta_log/
+│       └── *.parquet
+└── person/
+    └── delta_table/
+        ├── _delta_log/
+        └── *.parquet
+```
+
+## Schema Examples
+
+Silver Layer stores fully structured data with diff columns:
+
+```
+movies (Silver Layer):
+├── data_type
+├── id_of_data_type
+├── timestamp
+├── process_timestamp
+├── batch_version
+├── parsed_raw_df
+│   ├── movie_detail (title, overview, release_date, ...)
+│   ├── casts_info (cast_id, character, person_id, ...)
+│   └── crews_info (person_id, job, department, ...)
+├── casts_elements_hash
+├── casts_total_hash
+├── casts_diff
+│   ├── added (array of cast_ids)
+│   └── removed (array of cast_ids)
+├── crews_elements_hash
+├── crews_total_hash
+├── crews_diff
+│   ├── added (array of person_ids)
+│   └── removed (array of person_ids)
+├── vector_info_hash
+└── vector_info_hash_diff (boolean)
+```
+
+## Performance Optimization
+
+<Tip>
+**Incremental Processing**: By tracking batch versions in Redis and using Delta CDF, the Silver Layer only processes new Bronze data since the last run.
+</Tip>
+
+### Key Optimizations
+
+1. **Version tracking**: Prevent reprocessing already-handled data
+2. **Hash-based comparison**: Fast change detection without deep comparisons
+3. **Selective updates**: Only update records when source timestamp is newer
+4. **Columnar storage**: Parquet format for efficient analytical queries
+5. **Data skipping**: Delta statistics enable predicate pushdown
+
+## Change Tracking Benefits
+
+<CardGroup cols={2}>
+  <Card title="Cost Savings" icon="dollar-sign">
+    Only update Neo4j/Pinecone when data actually changes
+  </Card>
+  <Card title="Performance" icon="gauge-high">
+    Avoid expensive full-graph rebuilds on every batch
+  </Card>
+  <Card title="Accuracy" icon="bullseye">
+    Know exactly which relationships changed
+  </Card>
+  <Card title="Debuggability" icon="magnifying-glass">
+    Audit trail of all modifications over time
+  </Card>
+</CardGroup>
+
+## Monitoring and Operations
+
+### Key Metrics
+
+- **Deduplication ratio**: Percentage of duplicates removed
+- **Parse success rate**: Records successfully parsed vs. schema errors
+- **Change detection rate**: Percentage of records with detected changes
+- **Merge duration**: Time to complete upsert operations
+
+### Operational Tasks
+
+<Steps>
+  <Step title="Monitor Redis versions">
+    Ensure version tracking is updating correctly after each batch
+  </Step>
+  <Step title="Check parse failures">
+    If parsing fails, investigate schema mismatches
+  </Step>
+  <Step title="Validate change detection">
+    Spot-check that diffs correctly identify modifications
+  </Step>
+  <Step title="Optimize compaction">
+    Regularly compact Delta tables to maintain query performance
+  </Step>
+</Steps>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Gold Layer" icon="arrow-right" href="/storage/gold-layer">
+    See how Silver data is transformed for specific use cases
+  </Card>
+  <Card title="Delta Lake" icon="database" href="/storage/delta-lake">
+    Deep dive into Delta Lake features and operations
+  </Card>
+</CardGroup>

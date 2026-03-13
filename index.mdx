@@ -1,97 +1,112 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Entertainment Data Platform"
+description: "A distributed data platform that ingests and organizes movie, TV series, and people data to enable interactive search, analytics, and RAG applications"
 ---
 
-## Setting up
+<div style={{textAlign: 'center', padding: '3rem 0'}}>
+  <h1 style={{fontSize: '3rem', fontWeight: 700, color: '#1a1a1a', marginBottom: '1rem'}}>
+    Entertainment Data Platform
+  </h1>
+  <p style={{fontSize: '1.25rem', color: '#545454', maxWidth: '800px', margin: '0 auto 2rem'}}>
+    A high-performance data engineering ecosystem that processes large-scale Movies, TV Series, and People data using Medallion Architecture powered by Delta Lake
+  </p>
+  <div style={{display: 'flex', gap: '1rem', justifyContent: 'center', marginTop: '2rem'}}>
+    <a href="/quickstart" style={{
+      backgroundColor: '#94cb04',
+      color: '#1a1a1a',
+      padding: '0.75rem 2rem',
+      borderRadius: '6px',
+      textDecoration: 'none',
+      fontWeight: 600,
+      display: 'inline-block'
+    }}>
+      Get Started
+    </a>
+    <a href="/architecture" style={{
+      backgroundColor: '#e6e6e6',
+      color: '#1a1a1a',
+      padding: '0.75rem 2rem',
+      borderRadius: '6px',
+      textDecoration: 'none',
+      fontWeight: 600,
+      display: 'inline-block'
+    }}>
+      View Architecture
+    </a>
+  </div>
+</div>
 
-Get your documentation site up and running in minutes.
+## Key Features
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={3}>
+  <Card title="Medallion Architecture" icon="layer-group">
+    Bronze → Silver → Gold layers with Delta Lake for ACID transactions and schema evolution
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Real-time Streaming" icon="bolt">
+    High-throughput stream processing with Apache Kafka and Spark Structured Streaming
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Multi-Model Serving" icon="database">
+    OLAP (ClickHouse), Graph (Neo4j), and Vector (Pinecone) databases from a unified pipeline
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Fault-Tolerant Ingestion" icon="shield-check">
+    Dead Letter Queue (DLQ) for handling schema evolution and corrupted records
   </Card>
-</Columns>
+  <Card title="Change-Driven Sync" icon="arrows-rotate">
+    Intelligent change tracking to minimize expensive downstream updates
+  </Card>
+  <Card title="Production Ready" icon="rocket">
+    Seamless deployment with Docker Compose and Kubernetes manifests
+  </Card>
+</CardGroup>
 
-## Create beautiful pages
+## Quick Navigation
 
-Everything you need to create world-class documentation.
+<CardGroup cols={2}>
+  <Card title="Getting Started" icon="play" href="/quickstart">
+    Set up the platform locally and run your first pipeline
+  </Card>
+  <Card title="System Architecture" icon="sitemap" href="/architecture">
+    Understand the data flow and component interactions
+  </Card>
+  <Card title="Core Concepts" icon="book-open" href="/concepts/medallion-architecture">
+    Learn about Medallion Architecture and change tracking
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/collector">
+    Explore the module-level API documentation
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Platform Components
 
-## Need inspiration?
+<Steps>
+  <Step title="Data Collection">
+    Crawler scripts fetch Movies, TV Series, and People data from TMDB API with intelligent ID tracking
+  </Step>
+  <Step title="Stream Ingestion">
+    Kafka producers simulate real-world traffic with mixed record types (new, change, old)
+  </Step>
+  <Step title="Stream Processing">
+    Spark Structured Streaming consumes from Kafka with lightweight parsing and DLQ for fault tolerance
+  </Step>
+  <Step title="Batch Refinement">
+    Airflow orchestrates Bronze → Silver → Gold transformations with deduplication and change detection
+  </Step>
+  <Step title="Multi-Model Sync">
+    Refined data syncs to ClickHouse (analytics), Neo4j (graph), and Pinecone (vector search)
+  </Step>
+</Steps>
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+## Tech Stack
+
+The platform leverages industry-leading technologies:
+
+- **Languages**: Python, SQL
+- **Data Ingestion**: Apache Kafka, Apache Spark
+- **Orchestration**: Apache Airflow
+- **Storage**: Delta Lake, MinIO (S3-compatible object storage)
+- **Databases**: ClickHouse (OLAP), Neo4j (Graph), Pinecone (Vector)
+- **Infrastructure**: Docker, Kubernetes
+
+<Note>
+  This platform implements a Medallion Architecture that bridges the gap between raw Kafka streams and specialized downstream applications, ensuring data reliability through ACID transactions and optimizing performance with intelligent change-tracking.
+</Note>

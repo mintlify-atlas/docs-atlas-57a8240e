@@ -1,0 +1,865 @@
+---
+title: 'Batch Jobs API'
+description: 'API reference for batch processing pipelines with Spark, ClickHouse, Neo4j, and Pinecone'
+---
+
+## Overview
+
+The Batch Jobs module provides data processing pipelines that transform data through the medallion architecture (Bronze → Silver → Gold). It orchestrates complex transformations using Apache Spark and writes to multiple storage systems including ClickHouse, Neo4j, and Pinecone.
+
+## Architecture
+
+<CardGroup cols={3}>
+  <Card title="Bronze → Silver" icon="gem">
+    Deduplication and timestamp-based upserting
+  </Card>
+  
+  <Card title="Silver → Silver" icon="database">
+    Extract and transform to ClickHouse analytics database
+  </Card>
+  
+  <Card title="Silver → Gold" icon="share-nodes">
+    Build knowledge graph (Neo4j) and vector index (Pinecone)
+  </Card>
+</CardGroup>
+
+## Pipeline Components
+
+### Bronze to Silver Pipeline
+
+<ParamField path="run_dedup_timestamp" type="function">
+  Deduplicates records based on timestamp from Bronze to Silver layer in Delta Lake.
+
+  **Location**: `src/batch_jobs/pipelines/bronze_silver/minio_to_minio.py:19`
+
+  **Process Flow**:
+  1. Loads configuration and initializes Spark session
+  2. Gets last processed version from Redis
+  3. Reads Change Data Feed (CDF) from Bronze Delta tables
+  4. Performs upsert based on timestamp to keep latest records
+  5. Writes deduplicated data to Silver layer
+  6. Updates version in Redis
+
+  **Data Types Processed**: movie, tv_series, person
+
+  **Key Operations**:
+  - Change Data Feed reading for incremental processing
+  - Timestamp-based deduplication
+  - Batch version tracking in Redis
+</ParamField>
+
+### Silver to Silver Pipeline
+
+<ParamField path="write_minio_to_clickhouse" type="function">
+  Transforms and writes data from Delta Lake (Silver) to ClickHouse tables.
+
+  **Location**: `src/batch_jobs/pipelines/silver_silver/minio_to_clickhouse.py:80`
+
+  **Process Flow**:
+  1. Initializes ClickHouse tables
+  2. Reads Silver layer Delta tables filtered by batch version
+  3. Transforms data for each ClickHouse table using transform functions
+  4. Writes to ClickHouse using native protocol
+  5. Processes multiple tables per data type
+
+  **Tables Created**:
+  - **movie**: movie, movie_cast, movie_crew
+  - **person**: person
+  - **tv_series**: tv_series, tv_series_cast, tv_series_crew
+
+  **Features**:
+  - Native ClickHouse protocol for high performance
+  - Batch version tracking for idempotency
+  - Schema transformation and denormalization
+</ParamField>
+
+<ParamField path="process_table" type="function">
+  Core processing logic for transforming Delta tables to ClickHouse.
+
+  **Location**: `src/batch_jobs/pipelines/silver_silver/minio_to_clickhouse.py:35`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="settings" type="Settings" required>
+      Application configuration
+    </ParamField>
+    <ParamField path="redis_client" type="RedisClient" required>
+      Redis client for version tracking
+    </ParamField>
+    <ParamField path="delta_minio_reader" type="DeltaMinioReader" required>
+      Reader for Delta Lake tables
+    </ParamField>
+    <ParamField path="clickhouse_writer" type="ClickHouseNativeWriter" required>
+      Writer for ClickHouse tables
+    </ParamField>
+    <ParamField path="transform_map" type="dict" default="TRANSFORM_MAP">
+      Mapping of data types to transform functions
+    </ParamField>
+  </Expandable>
+
+  **Transform Map Structure**:
+  ```python
+  {
+      "data_type": [
+          {"table_name": "table1", "transform_func": prepare_func1},
+          {"table_name": "table2", "transform_func": prepare_func2}
+      ]
+  }
+  ```
+</ParamField>
+
+### Silver to Gold Pipelines
+
+#### Neo4j Knowledge Graph
+
+<ParamField path="write_clickhouse_to_neo4j" type="function">
+  Builds knowledge graph in Neo4j from ClickHouse data.
+
+  **Location**: `src/batch_jobs/pipelines/silver_gold/clickhouse_to_neo4j.py:181`
+
+  **Process Flow**:
+  1. Processes nodes (Movie, Person, TV_Series)
+  2. Creates relationships (ACTED_IN, WORKS_ON)
+  3. Handles relationship adds and removes from diff columns
+  4. Uses batch version for incremental updates
+
+  **Node Labels**:
+  - **Movie**: movie_id, title, overview, popularity, etc.
+  - **Person**: person_id, name, biography, birthday, etc.
+  - **TV_Series**: tv_series_id, overview, first_air_date, etc.
+
+  **Relationships**:
+  - **ACTED_IN**: Person → Movie/TV_Series (with cast details)
+  - **WORKS_ON**: Person → Movie/TV_Series (with crew details)
+
+  **Features**:
+  - Constraint-based node creation
+  - Relationship properties (character, job, department)
+  - Handles adds/removes from change tracking
+</ParamField>
+
+<ParamField path="process_nodes" type="function">
+  Processes and writes node data to Neo4j.
+
+  **Location**: `src/batch_jobs/pipelines/silver_gold/clickhouse_to_neo4j.py:77`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="transform_map" type="dict" required>
+      Configuration mapping for nodes
+    </ParamField>
+    <ParamField path="settings" type="Settings" required>
+      Application settings
+    </ParamField>
+    <ParamField path="redis_client" type="RedisClient" required>
+      For batch version tracking
+    </ParamField>
+    <ParamField path="clickhouse_reader" type="ClickHouseReader" required>
+      Reads from ClickHouse
+    </ParamField>
+    <ParamField path="neo4j_writer" type="Neo4jWriter" required>
+      Writes to Neo4j
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField path="process_relationships" type="function">
+  Processes and writes relationship data to Neo4j.
+
+  **Location**: `src/batch_jobs/pipelines/silver_gold/clickhouse_to_neo4j.py:109`
+
+  **Parameters**: Same as `process_nodes`
+
+  **Process**:
+  1. Joins main table with association table
+  2. Extracts relationships from diff columns
+  3. Handles both added and removed relationships
+  4. Creates bidirectional connections
+</ParamField>
+
+#### Pinecone Vector Index
+
+<ParamField path="write_clickhouse_to_pinecone" type="function">
+  Creates vector embeddings and writes to Pinecone for semantic search.
+
+  **Location**: `src/batch_jobs/pipelines/silver_gold/clickhouse_to_pinecone.py:30`
+
+  **Process Flow**:
+  1. Reads movie and tv_series data from ClickHouse
+  2. Prepares vector schema (combines overview + tagline)
+  3. Generates embeddings using e5-large-v2 model
+  4. Writes vectors to Pinecone with metadata
+
+  **Transform Map**:
+  ```python
+  {
+      "movie": {
+          "id_col": "movie_id",
+          "vector_prepare_cols": ["overview", "tagline"],
+          "vector_col_name": "document",
+          "metadata": "{}"
+      },
+      "tv_series": {
+          "id_col": "tv_series_id",
+          "vector_prepare_cols": ["overview", "tagline"],
+          "vector_col_name": "document",
+          "metadata": "{}"
+      }
+  }
+  ```
+
+  **Embedding Model**: intfloat/e5-large-v2
+
+  **Namespaces**: Separate namespace per data type
+</ParamField>
+
+## I/O Components
+
+### Readers
+
+#### DeltaMinioReader
+
+<ResponseField name="DeltaMinioReader" type="class">
+  Reads Delta Lake tables from MinIO storage.
+
+  **Location**: `src/batch_jobs/io/readers/delta_minio_reader.py:8`
+</ResponseField>
+
+<ParamField path="__init__" type="method">
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="spark" type="SparkSession" required>
+      Active Spark session
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField path="read_table" type="method" returnType="DataFrame">
+  Reads entire Delta table.
+
+  **Location**: `src/batch_jobs/io/readers/delta_minio_reader.py:17`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="target_path" type="str" required>
+      S3 path to Delta table (e.g., s3a://bucket/path)
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField path="read_table_with_filters" type="method" returnType="DataFrame">
+  Reads Delta table with filter conditions.
+
+  **Location**: `src/batch_jobs/io/readers/delta_minio_reader.py:23`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="target_path" type="str" required>
+      S3 path to Delta table
+    </ParamField>
+    <ParamField path="filters" type="dict" required>
+      Dictionary of column_name: value filters
+    </ParamField>
+  </Expandable>
+
+  **Example**:
+  ```python
+  filters = {"batch_version": 42, "data_type": "movie"}
+  df = reader.read_table_with_filters("s3a://silver/movie", filters)
+  ```
+</ParamField>
+
+<ParamField path="read_table_cdf" type="method" returnType="DataFrame">
+  Reads Change Data Feed from Delta table for incremental processing.
+
+  **Location**: `src/batch_jobs/io/readers/delta_minio_reader.py:39`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="target_path" type="str" required>
+      S3 path to Delta table
+    </ParamField>
+    <ParamField path="start_timestamp" type="str | None">
+      Start timestamp for CDF range
+    </ParamField>
+    <ParamField path="end_timestamp" type="str | None">
+      End timestamp for CDF range
+    </ParamField>
+    <ParamField path="start_version" type="int | None">
+      Start version for CDF range
+    </ParamField>
+    <ParamField path="end_version" type="int | None">
+      End version for CDF range
+    </ParamField>
+  </Expandable>
+
+  **CDF Columns Added**:
+  - `_change_type`: insert, update_preimage, update_postimage, delete
+  - `_commit_version`: Delta table version
+  - `_commit_timestamp`: Commit timestamp
+</ParamField>
+
+#### ClickHouseReader
+
+<ResponseField name="ClickHouseReader" type="class">
+  Reads tables from ClickHouse using Spark.
+
+  **Location**: `src/batch_jobs/io/readers/clickhouse_reader.py:8`
+</ResponseField>
+
+<ParamField path="read_table" type="method" returnType="DataFrame">
+  Reads ClickHouse table using SQL query.
+
+  **Location**: `src/batch_jobs/io/readers/clickhouse_reader.py:25`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="query" type="str" required>
+      SQL query to execute
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField path="read_table_with_filters" type="method" returnType="DataFrame">
+  Reads ClickHouse table with filter conditions.
+
+  **Location**: `src/batch_jobs/io/readers/clickhouse_reader.py:32`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="table_name" type="str" required>
+      Name of ClickHouse table
+    </ParamField>
+    <ParamField path="filters" type="list[dict]" required>
+      List of filter dictionaries
+    </ParamField>
+  </Expandable>
+
+  **Example**:
+  ```python
+  filters = [{"batch_version": 42}, {"data_type": "movie"}]
+  df = reader.read_table_with_filters("movie", filters)
+  ```
+</ParamField>
+
+### Writers
+
+#### ClickHouseNativeWriter
+
+<ResponseField name="ClickHouseNativeWriter" type="class">
+  Writes DataFrames to ClickHouse using native protocol.
+
+  **Location**: `src/batch_jobs/io/writers/clickhouse_native_writer.py`
+
+  **Protocol**: ClickHouse native (high performance)
+</ResponseField>
+
+<ParamField path="write_table" type="method">
+  Writes DataFrame to ClickHouse table.
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="df" type="DataFrame" required>
+      Spark DataFrame to write
+    </ParamField>
+    <ParamField path="table_name" type="str" required>
+      Target ClickHouse table name
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+#### Neo4jWriter
+
+<ResponseField name="Neo4jWriter" type="class">
+  Writes graph data to Neo4j.
+
+  **Location**: `src/batch_jobs/io/writers/neo4j_writer.py:13`
+</ResponseField>
+
+<ParamField path="write_node_constraint" type="method">
+  Writes nodes with strict key constraints.
+
+  **Location**: `src/batch_jobs/io/writers/neo4j_writer.py:20`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="df" type="DataFrame" required>
+      DataFrame containing node data
+    </ParamField>
+    <ParamField path="label" type="str" required>
+      Neo4j node label (e.g., "Movie", "Person")
+    </ParamField>
+    <ParamField path="keys" type="list[str]" required>
+      List of key property names for constraints
+    </ParamField>
+  </Expandable>
+
+  **Write Mode**: Overwrite
+
+  **Optimization**: KEY constraint with TYPE optimization
+</ParamField>
+
+<ParamField path="write_node_normal" type="method">
+  Writes nodes with UNIQUE constraints (allows nulls).
+
+  **Location**: `src/batch_jobs/io/writers/neo4j_writer.py:49`
+
+  **Parameters**: Same as `write_node_constraint`
+
+  **Optimization**: UNIQUE constraint with null skipping
+</ParamField>
+
+<ParamField path="write_relationship" type="method">
+  Writes relationships between nodes.
+
+  **Location**: `src/batch_jobs/io/writers/neo4j_writer.py:79`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="df" type="DataFrame" required>
+      DataFrame with relationship data
+    </ParamField>
+    <ParamField path="repartition_cols" type="list[str]" required>
+      Columns to repartition on for parallelism
+    </ParamField>
+    <ParamField path="relationship" type="str" required>
+      Relationship type (e.g., "ACTED_IN", "WORKS_ON")
+    </ParamField>
+    <ParamField path="source_label" type="str" required>
+      Label of source node
+    </ParamField>
+    <ParamField path="source_keys" type="list[str]" required>
+      Key properties of source node
+    </ParamField>
+    <ParamField path="source_properties" type="list[str]" required>
+      Additional properties for source node
+    </ParamField>
+    <ParamField path="target_label" type="str" required>
+      Label of target node
+    </ParamField>
+    <ParamField path="target_keys" type="list[str]" required>
+      Key properties of target node
+    </ParamField>
+    <ParamField path="target_properties" type="list[str]" required>
+      Additional properties for target node
+    </ParamField>
+    <ParamField path="relationship_properties" type="list[str]" required>
+      Properties to store on the relationship
+    </ParamField>
+    <ParamField path="partition_num" type="int" default="1">
+      Number of partitions for parallel writes
+    </ParamField>
+    <ParamField path="action_col" type="str" default="added">
+      Action type ("added" or "removed")
+    </ParamField>
+  </Expandable>
+
+  **Features**:
+  - Adds `is_deleted` flag based on action_col
+  - Creates or updates source and target nodes
+  - Batch writing for performance
+</ParamField>
+
+#### PineconeWriter
+
+<ResponseField name="PineconeWriter" type="class">
+  Writes vector embeddings to Pinecone.
+
+  **Location**: `src/batch_jobs/io/writers/pinecone_writer.py:6`
+</ResponseField>
+
+<ParamField path="write_index" type="method">
+  Writes DataFrame with vector embeddings to Pinecone index.
+
+  **Location**: `src/batch_jobs/io/writers/pinecone_writer.py:12`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="df" type="DataFrame" required>
+      DataFrame with vector schema (id, values, namespace, metadata)
+    </ParamField>
+  </Expandable>
+
+  **Write Mode**: Append
+
+  **Required DataFrame Columns**:
+  - `id`: Unique identifier
+  - `values`: Vector embedding array
+  - `namespace`: Pinecone namespace
+  - `metadata`: JSON metadata
+</ParamField>
+
+## Transform Functions
+
+### Delta to ClickHouse Transforms
+
+Located in `src/batch_jobs/tranforms/delta_clickhouse/`:
+
+<ParamField path="prepare_table_movie" type="function">
+  Transforms movie DataFrame for ClickHouse.
+  
+  Extracts and flattens movie-level fields from nested JSON.
+</ParamField>
+
+<ParamField path="prepare_table_person" type="function">
+  Transforms person DataFrame for ClickHouse.
+  
+  Extracts person details and biographical information.
+</ParamField>
+
+<ParamField path="prepare_table_tv_series" type="function">
+  Transforms TV series DataFrame for ClickHouse.
+  
+  Extracts series metadata and episode information.
+</ParamField>
+
+<ParamField path="prepare_table_movie_cast" type="function">
+  Extracts cast relationships from movie data.
+  
+  Unnests cast arrays and creates association records.
+</ParamField>
+
+<ParamField path="prepare_table_movie_crew" type="function">
+  Extracts crew relationships from movie data.
+  
+  Unnests crew arrays with department and job details.
+</ParamField>
+
+### ClickHouse to Neo4j Transforms
+
+<ParamField path="join_to_get_relationship" type="function">
+  Joins tables to extract relationship data from diff columns.
+
+  **Location**: `src/batch_jobs/tranforms/clickhouse_neo4j/join_relationship.py`
+
+  **Process**:
+  1. Joins main entity table with association table
+  2. Unnests diff column to get added/removed items
+  3. Extracts relationship properties
+  4. Prepares source and target node keys
+</ParamField>
+
+### ClickHouse to Pinecone Transforms
+
+<ParamField path="prepare_vector_schema" type="function">
+  Prepares DataFrame for vector embedding and Pinecone upload.
+
+  **Location**: `src/batch_jobs/tranforms/clickhouse_pinecone/prepare_vector_df.py`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="df" type="DataFrame" required>
+      Source DataFrame
+    </ParamField>
+    <ParamField path="id_col" type="str" required>
+      Column to use as vector ID
+    </ParamField>
+    <ParamField path="namespace" type="str" required>
+      Pinecone namespace
+    </ParamField>
+    <ParamField path="model_name" type="str" required>
+      HuggingFace model for embeddings
+    </ParamField>
+    <ParamField path="vector_prepare_cols" type="list[str]" required>
+      Columns to combine for embedding
+    </ParamField>
+    <ParamField path="vector_col_name" type="str" required>
+      Name for combined text column
+    </ParamField>
+    <ParamField path="metadata" type="str" required>
+      JSON metadata string
+    </ParamField>
+  </Expandable>
+
+  **Process**:
+  1. Combines text columns into document
+  2. Generates embeddings using specified model
+  3. Formats to Pinecone schema (id, values, namespace, metadata)
+</ParamField>
+
+## Runtime Components
+
+### Spark Builders
+
+<ParamField path="create_spark_minio" type="function" returnType="SparkSession.Builder">
+  Creates Spark session builder configured for MinIO access.
+
+  **Location**: `src/batch_jobs/run_time/spark/builder/spark_builder_minio.py`
+
+  **Configuration**:
+  - Delta Lake support
+  - S3A filesystem for MinIO
+  - Change Data Feed enabled
+</ParamField>
+
+<ParamField path="create_spark_minio_clickhouse" type="function" returnType="SparkSession.Builder">
+  Creates Spark session builder with MinIO and ClickHouse connectors.
+
+  **Location**: `src/batch_jobs/run_time/spark/builder/spark_builder_minio_clickhouse.py`
+
+  **Configuration**:
+  - Delta Lake + ClickHouse JDBC driver
+  - Native ClickHouse connector
+</ParamField>
+
+<ParamField path="create_spark_clickhouse_neo4j_pinecone" type="function" returnType="SparkSession.Builder">
+  Creates Spark session builder with ClickHouse, Neo4j, and Pinecone connectors.
+
+  **Location**: `src/batch_jobs/run_time/spark/builder/spark_builder_clickhouse_neo4j_pinecone.py`
+
+  **Configuration**:
+  - ClickHouse native connector
+  - Neo4j Spark connector
+  - Pinecone Spark connector
+  - All necessary credentials
+</ParamField>
+
+### Redis Client
+
+<ResponseField name="RedisClient" type="class">
+  Redis client for batch version tracking and coordination.
+
+  **Location**: `src/batch_jobs/run_time/redis/redis_client.py`
+</ResponseField>
+
+<ParamField path="get" type="method" returnType="int | None">
+  Gets batch version from Redis.
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="key" type="str" required>
+      Redis key for batch version
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField path="set" type="method">
+  Sets batch version in Redis.
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="key" type="str" required>
+      Redis key for batch version
+    </ParamField>
+    <ParamField path="value" type="int" required>
+      Batch version number
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+## Usage Examples
+
+### Running Bronze to Silver Pipeline
+
+```python
+from batch_jobs.pipelines.bronze_silver.minio_to_minio import run_dedup_timestamp
+
+# Deduplicate and upsert based on timestamp
+run_dedup_timestamp()
+```
+
+### Running Silver to ClickHouse Pipeline
+
+```python
+from batch_jobs.pipelines.silver_silver.minio_to_clickhouse import write_minio_to_clickhouse
+
+# Transform and write to ClickHouse
+write_minio_to_clickhouse()
+```
+
+### Running Neo4j Knowledge Graph Pipeline
+
+```python
+from batch_jobs.pipelines.silver_gold.clickhouse_to_neo4j import write_clickhouse_to_neo4j
+
+# Build knowledge graph
+write_clickhouse_to_neo4j()
+```
+
+### Running Pinecone Vector Index Pipeline
+
+```python
+from batch_jobs.pipelines.silver_gold.clickhouse_to_pinecone import write_clickhouse_to_pinecone
+
+# Create vector embeddings and upload
+write_clickhouse_to_pinecone()
+```
+
+### Reading Delta Tables
+
+```python
+from batch_jobs.io.readers.delta_minio_reader import DeltaMinioReader
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+reader = DeltaMinioReader(spark)
+
+# Read full table
+df = reader.read_table("s3a://silver/movie/valid")
+
+# Read with filters
+df = reader.read_table_with_filters(
+    target_path="s3a://silver/movie/valid",
+    filters={"batch_version": 42}
+)
+
+# Read Change Data Feed
+df = reader.read_table_cdf(
+    target_path="s3a://bronze/movie/valid",
+    start_version=10,
+    end_version=20
+)
+
+# CDF shows what changed
+df.filter(df._change_type == "insert").show()
+```
+
+### Writing to Neo4j
+
+```python
+from batch_jobs.io.writers.neo4j_writer import Neo4jWriter
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+writer = Neo4jWriter(spark)
+
+# Write nodes
+movie_df = spark.createDataFrame([
+    {"movie_id": 1, "title": "The Matrix", "year": 1999}
+])
+
+writer.write_node_constraint(
+    df=movie_df,
+    label="Movie",
+    keys=["movie_id"]
+)
+
+# Write relationships
+acted_in_df = spark.createDataFrame([
+    {"person_id": 100, "movie_id": 1, "character": "Neo"}
+])
+
+writer.write_relationship(
+    df=acted_in_df,
+    repartition_cols=["movie_id"],
+    relationship="ACTED_IN",
+    source_label="Person",
+    source_keys=["person_id"],
+    source_properties=[],
+    target_label="Movie",
+    target_keys=["movie_id"],
+    target_properties=[],
+    relationship_properties=["character"]
+)
+```
+
+### Writing to Pinecone
+
+```python
+from batch_jobs.io.writers.pinecone_writer import PineconeWriter
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+writer = PineconeWriter(spark)
+
+# DataFrame must have: id, values, namespace, metadata
+vector_df = spark.createDataFrame([
+    {
+        "id": "movie_1",
+        "values": [0.1, 0.2, ..., 0.5],  # 1024-dim vector
+        "namespace": "movies",
+        "metadata": '{"title": "The Matrix"}'
+    }
+])
+
+writer.write_index(vector_df)
+```
+
+## Orchestration (Airflow)
+
+The batch jobs can be orchestrated with Apache Airflow:
+
+```python
+# Example DAG structure (from batch_jobs/dags/batch_jobs.py)
+
+@dag(schedule="*/10 * * * *", catchup=False)
+def full_batch_jobs():
+    
+    @task()
+    def job_dedup_timestamp():
+        run_dedup_timestamp()
+    
+    @task()
+    def job_extract_to_clickhouse():
+        write_minio_to_clickhouse()
+    
+    @task()
+    def job_write_to_neo4j():
+        write_clickhouse_to_neo4j()
+    
+    @task()
+    def job_write_to_pinecone():
+        write_clickhouse_to_pinecone()
+    
+    # Pipeline dependencies
+    (job_dedup_timestamp() >> 
+     job_extract_to_clickhouse() >> 
+     job_write_to_neo4j() >> 
+     job_write_to_pinecone())
+```
+
+## Data Flow
+
+<Steps>
+  <Step title="Bronze → Silver">
+    Deduplicate records by timestamp using Change Data Feed
+  </Step>
+  
+  <Step title="Silver → ClickHouse">
+    Transform and denormalize for analytical queries
+  </Step>
+  
+  <Step title="ClickHouse → Neo4j">
+    Build knowledge graph with entities and relationships
+  </Step>
+  
+  <Step title="ClickHouse → Pinecone">
+    Generate embeddings for semantic search
+  </Step>
+</Steps>
+
+## Best Practices
+
+<Tip>
+**Version Tracking**: Always use Redis to track batch versions for idempotent processing
+
+**Incremental Processing**: Leverage Change Data Feed to process only changed data
+
+**Error Recovery**: Batch version tracking allows reprocessing from last successful state
+
+**Parallelism**: Configure Spark partitions based on data volume and cluster size
+
+**Monitoring**: Track batch versions, record counts, and processing times
+</Tip>
+
+## Configuration
+
+Environment variables and settings are loaded from YAML configuration files similar to other modules, with additional settings for:
+
+- **Spark**: Application names, master URL, executor configuration
+- **ClickHouse**: JDBC URL, credentials, batch sizes
+- **Neo4j**: Connection URI, credentials, batch sizes
+- **Pinecone**: API key, index name, namespaces
+- **Redis**: Host, port, key prefixes for version tracking
+
+## Related APIs
+
+<CardGroup cols={2}>
+  <Card title="Stream Processor" icon="water" href="/api/stream-processor">
+    Creates Bronze layer Delta tables processed by batch jobs
+  </Card>
+  
+  <Card title="Ingestion API" icon="filter" href="/api/ingestion">
+    Sources data that flows through the entire pipeline
+  </Card>
+</CardGroup>

@@ -1,0 +1,546 @@
+---
+title: 'Monitoring'
+description: 'Monitor the health, performance, and data quality of the Entertainment Data Platform'
+---
+
+## Overview
+
+The Entertainment Data Platform provides comprehensive logging and monitoring capabilities across all components. This guide covers how to monitor system health, track data flows, and identify issues.
+
+## Logging Architecture
+
+All services use a centralized logging configuration that outputs structured logs to stdout.
+
+### Log Format
+
+```
+%(asctime)s | %(levelname)s | %(name)s | %(message)s
+```
+
+Example log output:
+```
+2024-03-13 10:15:23,456 | INFO | ingestion.producer.kafka_producer | Kafka Producer initialized
+2024-03-13 10:15:24,123 | INFO | ingestion.producer.kafka_producer | Message delivered successfully to tmdb.movies.raw, partition 2, offset 1543
+```
+
+### Setting Log Levels
+
+Control verbosity using the `LOG_LEVEL` environment variable:
+
+```bash
+# Development environment - detailed logs
+export LOG_LEVEL=DEBUG
+
+# Production environment - informational logs
+export LOG_LEVEL=INFO
+
+# Troubleshooting - all logs
+export LOG_LEVEL=DEBUG
+```
+
+<Info>
+All log output is sent to `stdout` for compatibility with container orchestration platforms like Kubernetes and Docker.
+</Info>
+
+## Component-Specific Monitoring
+
+### Ingestion Service Monitoring
+
+The Ingestion service logs key events during data ingestion:
+
+#### Startup and Configuration
+
+```python
+logger.info("Ingestion service starting...")
+logger.info("Loading configuration...")
+logger.info("Configuration loaded")
+```
+
+#### Kafka Producer Events
+
+```python src/ingestion/producer/kafka_producer.py
+# Successful message delivery
+logger.info("Message delivered successfully to %s, partition %s, offset %d", 
+           msg.topic(), msg.partition(), msg.offset())
+
+# Failed message delivery
+logger.error("Failed to deliver message %s with error %s", str(msg), err)
+
+# Buffer issues
+logger.error("Kafka buffer is full, waiting")
+```
+
+#### Data Processing Progress
+
+```python src/ingestion/main.py
+# Record processing counter
+logger.info("Processed %d records", total_record_count)
+```
+
+<Accordion title="Key Metrics to Monitor">
+- **Records processed per second** - Track ingestion throughput
+- **Kafka buffer full errors** - Indicates producer backpressure
+- **Failed deliveries** - Monitor message delivery failures
+- **Processing lag** - Time between file read and Kafka publish
+</Accordion>
+
+### Stream Processor Monitoring
+
+The Stream Processor provides detailed logging for streaming operations:
+
+#### Spark Session Initialization
+
+```python src/stream_processor/main.py
+logger.info("Loading configuration...")
+logger.info("Configuration loaded")
+logger.info("Starting Spark session...")
+logger.info("Spark session started")
+```
+
+#### MinIO Bucket Management
+
+```python src/stream_processor/runtime/minio_client.py
+logger.info(f"Bucket {bucket_name} exists: {ans}")
+logger.info(f"Bucket {bucket_name} does not exist. Creating bucket...")
+logger.info(f"Bucket {bucket_name} created successfully.")
+logger.info(f"Bucket {bucket_name} already exists.")
+```
+
+#### Stream Processing Metrics
+
+```python src/stream_processor/sinks/delta_lake_sink.py
+def log_batch(batch_df, batch_id):
+    logger.info("Batch %s count=%s", batch_id, batch_df.count())
+    batch_df.show(truncate=False)
+```
+
+#### Path Configuration
+
+```python src/stream_processor/main.py
+logger.info("All path for topic %s: \nvalid_table_path: %s \ninvalid_table_path: %s \nvalid_checkpoint_path: %s \ninvalid_checkpoint_path: %s", 
+           name, valid_table_path, invalid_table_path, valid_checkpoint_path, invalid_checkpoint_path)
+```
+
+<Accordion title="Key Metrics to Monitor">
+- **Batch processing time** - Monitor streaming performance
+- **Records per batch** - Track batch sizes for tuning
+- **Valid vs Invalid records** - Data quality indicator
+- **Checkpoint lag** - Monitor streaming checkpoint progress
+- **MinIO bucket operations** - Storage health
+</Accordion>
+
+### Batch Jobs Monitoring
+
+The Batch Jobs service logs pipeline execution and data transformations:
+
+#### Pipeline Startup
+
+```python src/batch_jobs/pipelines/silver_silver/minio_to_clickhouse.py
+logger.info("Batch jobs from Delta Minio to write to Clickhouse: Starting...")
+logger.info("Loading configuration...")
+logger.info("Configuration loaded")
+logger.info("Init Clickhouse Table...")
+logger.info("Finish init Clickhouse Table")
+```
+
+#### Data Processing Flow
+
+```python
+logger.info(f"Processing data type: {data_type}")
+logger.info(f"Last version for {version_key} found in Redis: {last_version}")
+logger.info(f"Processing transform for Clickhouse table: {table_name}")
+logger.info(f"Finish processing transform for Clickhouse table: {table_name}")
+logger.info(f"Finish processing data type: {data_type}")
+```
+
+#### Error Handling
+
+```python
+logger.error(f"CRITICAL: Last version for {version_key} NOT found in Redis. Aborting pipeline.")
+logger.warning(f"Data type {data_type} not found in transform_map. Skipping...")
+```
+
+<Accordion title="Key Metrics to Monitor">
+- **Pipeline execution time** - Track batch processing duration
+- **Records processed per pipeline** - Monitor data volume
+- **Redis version tracking** - Ensure version consistency
+- **Failed writes** - Monitor write operations to ClickHouse/Neo4j/Pinecone
+- **Schema parsing errors** - Data quality issues
+</Accordion>
+
+## Data Quality Monitoring
+
+### Valid vs Invalid Data Streams
+
+The Stream Processor separates data into valid and invalid streams based on schema validation:
+
+```python src/stream_processor/processor/event_processor.py
+def valid_full_schema(df: DataFrame):
+    """Check valid schema by adding boolean value to Column "valid_schema"""
+    return df.withColumn(
+        "valid_schema",
+        col("data_type").isNotNull() &
+        col("data_label").isNotNull() &
+        col("timestamp").isNotNull() &
+        col("process_timestamp").isNotNull() &
+        col("id_of_data_type").isNotNull()
+    )
+```
+
+#### Schema Validation Checks
+
+The platform validates the following fields:
+- `data_type` - Must be present
+- `data_label` - Must be present
+- `timestamp` - Must be present
+- `process_timestamp` - Must be present
+- `id_of_data_type` - Must contain one of: `person_id`, `movie_id`, or `tv_series_id`
+
+<Warning>
+Records failing schema validation are written to the **invalid data path** for later analysis. Monitor the invalid paths regularly to identify data quality issues.
+</Warning>
+
+### Monitoring Invalid Records
+
+Invalid records are stored in separate Delta Lake tables:
+
+```yaml
+# Bronze layer invalid data
+s3a://deltalake/bronze/invalid/{data_type}
+
+# Silver layer invalid data
+s3a://deltalake/silver/invalid/{data_type}
+```
+
+<Steps>
+  <Step title="Query Invalid Records">
+    Use Spark or Delta Lake to query invalid records and identify patterns.
+  </Step>
+  
+  <Step title="Analyze Failure Reasons">
+    Check which validation fields are null or malformed.
+  </Step>
+  
+  <Step title="Fix Upstream Issues">
+    Correct data sources or transformation logic to reduce invalid records.
+  </Step>
+  
+  <Step title="Reprocess if Needed">
+    Once fixed, reprocess invalid records through the pipeline.
+  </Step>
+</Steps>
+
+## Storage Monitoring
+
+### Delta Lake Tables
+
+Monitor Delta Lake table growth and health:
+
+```bash
+# List all tables in MinIO bucket
+aws s3 ls s3://deltalake/bronze/valid/ --endpoint-url=http://localhost:9000
+
+# Check table size
+aws s3 ls s3://deltalake/bronze/valid/movies/ --recursive --summarize \
+  --endpoint-url=http://localhost:9000
+
+# View Delta Lake transaction log
+spark-sql --packages io.delta:delta-core_2.12:3.2.0 \
+  -e "DESCRIBE HISTORY delta.\`s3a://deltalake/bronze/valid/movies\`"
+```
+
+### ClickHouse Tables
+
+Monitor ClickHouse table statistics:
+
+```sql
+-- Check table row counts
+SELECT 
+    table,
+    sum(rows) as total_rows,
+    formatReadableSize(sum(bytes)) as total_size
+FROM system.parts
+WHERE database = 'silver_layer' AND active
+GROUP BY table
+ORDER BY total_rows DESC;
+
+-- Monitor query performance
+SELECT 
+    query_duration_ms,
+    query,
+    memory_usage,
+    read_rows
+FROM system.query_log
+WHERE type = 'QueryFinish'
+ORDER BY event_time DESC
+LIMIT 10;
+```
+
+### Redis Monitoring
+
+Track batch versions and deduplication state:
+
+```bash
+# Connect to Redis
+redis-cli -h localhost -p 6379
+
+# Check batch versions
+GET dedup_batch_version_movie
+GET dedup_batch_version_tv_series
+GET dedup_batch_version_person
+
+# Monitor Redis memory
+INFO memory
+
+# Check key count
+DBSIZE
+```
+
+<Note>
+Redis stores batch version numbers used for incremental processing. If versions are missing, pipelines will abort to prevent data inconsistency.
+</Note>
+
+## Health Checks
+
+### Service-Level Health Checks
+
+Implement health checks for each service:
+
+#### Ingestion Service
+
+```bash
+# Check if Kafka producer can connect
+docker exec ingestion-service python -c "
+from ingestion.config.settings import load_settings
+from ingestion.producer.kafka_producer import KafkaProducerService
+settings = load_settings()
+producer = KafkaProducerService(settings)
+print('Kafka Producer healthy')
+"
+```
+
+#### Stream Processor
+
+```bash
+# Verify Spark session can start
+docker exec stream-processor spark-submit --version
+
+# Check MinIO connectivity
+docker exec stream-processor python -c "
+from stream_processor.runtime.minio_client import MinioClient
+client = MinioClient()
+print('MinIO client healthy')
+"
+```
+
+#### Batch Jobs
+
+```bash
+# Verify ClickHouse connectivity
+docker exec batch-jobs python -c "
+from batch_jobs.run_time.clickhouse.clickhouse_init import init_clickhouse
+init_clickhouse()
+print('ClickHouse connection healthy')
+"
+
+# Check Redis connectivity
+docker exec batch-jobs python -c "
+from batch_jobs.run_time.redis.redis_client import RedisClient
+client = RedisClient()
+client.get('test_key')
+print('Redis connection healthy')
+"
+```
+
+### Infrastructure Health Checks
+
+Monitor external dependencies:
+
+<CardGroup cols={2}>
+  <Card title="Kafka" icon="layer-group">
+    ```bash
+    # Check broker status
+    kafka-broker-api-versions \
+      --bootstrap-server localhost:9092
+    
+    # Monitor consumer lag
+    kafka-consumer-groups \
+      --bootstrap-server localhost:9092 \
+      --describe --all-groups
+    ```
+  </Card>
+
+  <Card title="MinIO" icon="database">
+    ```bash
+    # Health check endpoint
+    curl http://localhost:9000/minio/health/live
+    
+    # Bucket listing
+    mc ls myminio/deltalake
+    ```
+  </Card>
+
+  <Card title="ClickHouse" icon="table">
+    ```bash
+    # Server ping
+    curl http://localhost:8123/ping
+    
+    # Check replicas (if using replication)
+    clickhouse-client -q \
+      "SELECT * FROM system.replicas"
+    ```
+  </Card>
+
+  <Card title="Redis" icon="key">
+    ```bash
+    # Ping Redis
+    redis-cli ping
+    
+    # Check replication status
+    redis-cli INFO replication
+    ```
+  </Card>
+</CardGroup>
+
+## Error Monitoring
+
+### Common Error Patterns
+
+Monitor logs for these error patterns:
+
+#### Configuration Errors
+
+```
+ERROR | Config file not found: /path/to/config.prod.yml
+```
+
+**Action**: Verify `APP_ENV` is set correctly and config file exists.
+
+#### Kafka Producer Errors
+
+```
+ERROR | Kafka buffer is full, waiting
+ERROR | Failed to deliver message ... with error ...
+```
+
+**Action**: Check Kafka broker health, increase buffer size, or reduce ingestion rate.
+
+#### Writer Errors
+
+```python
+logger.error("Error when write to Clickhouse table: %s.%s", database, table_name)
+logger.error("Error when writing Node to Neo4j with label: %s", label)
+```
+
+**Action**: Check database connectivity, schema compatibility, and resource limits.
+
+#### Data Validation Errors
+
+```python
+logger.error("Invalid data label: %s", data_label)
+```
+
+**Action**: Review data source and transformation logic.
+
+## Performance Monitoring
+
+### Spark UI Monitoring
+
+Access Spark UI for detailed metrics:
+
+```
+http://localhost:4040  # Stream Processor
+http://localhost:4041  # Batch Jobs (if running concurrently)
+```
+
+Monitor:
+- **Stages and Tasks** - Execution time and failures
+- **Storage** - RDD/DataFrame persistence
+- **Executors** - Resource utilization
+- **SQL** - Query execution plans
+
+### Kafka Monitoring
+
+Track Kafka metrics:
+
+```bash
+# Producer metrics
+kafka-run-class kafka.tools.JmxTool \
+  --object-name kafka.producer:type=producer-metrics,client-id=* \
+  --attributes record-send-rate,record-error-rate
+
+# Consumer lag by topic
+kafka-consumer-groups \
+  --bootstrap-server localhost:9092 \
+  --describe --group stream-processor-group
+```
+
+## Alerting Recommendations
+
+Set up alerts for critical conditions:
+
+<AccordionGroup>
+  <Accordion title="Data Pipeline Alerts">
+    - **No data processed in X minutes** - Pipeline stalled
+    - **High invalid record ratio (>10%)** - Data quality issue
+    - **Checkpoint lag increasing** - Processing falling behind
+    - **Kafka consumer lag growing** - Streaming backlog
+  </Accordion>
+
+  <Accordion title="Infrastructure Alerts">
+    - **Disk usage >80%** - Storage capacity issue
+    - **Memory usage >90%** - Resource exhaustion
+    - **Service restart detected** - Stability concern
+    - **Database connection failures** - Connectivity issue
+  </Accordion>
+
+  <Accordion title="Business Logic Alerts">
+    - **Missing batch version in Redis** - Pipeline will fail
+    - **Schema parsing errors** - Data format changed
+    - **Write failures to Gold layer** - Data loss risk
+  </Accordion>
+</AccordionGroup>
+
+## Log Aggregation
+
+For production environments, aggregate logs using:
+
+- **ELK Stack** (Elasticsearch, Logstash, Kibana)
+- **Grafana Loki** with Promtail
+- **Datadog** or other APM solutions
+- **CloudWatch Logs** (AWS) or **Stackdriver** (GCP)
+
+Example Logstash configuration:
+
+```ruby
+input {
+  docker {
+    type => "entertainment-platform"
+  }
+}
+
+filter {
+  grok {
+    match => { "message" => "%{TIMESTAMP_ISO8601:timestamp} \| %{LOGLEVEL:level} \| %{DATA:logger} \| %{GREEDYDATA:message}" }
+  }
+}
+
+output {
+  elasticsearch {
+    hosts => ["elasticsearch:9200"]
+    index => "entertainment-platform-%{+YYYY.MM.dd}"
+  }
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Configuration" icon="sliders" href="/operations/configuration">
+    Configure platform components for your environment
+  </Card>
+  
+  <Card title="Troubleshooting" icon="wrench" href="/operations/troubleshooting">
+    Resolve common operational issues
+  </Card>
+</CardGroup>

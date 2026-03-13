@@ -1,0 +1,496 @@
+---
+title: 'Configuration'
+description: 'Configure the Entertainment Data Platform components for different environments'
+---
+
+## Overview
+
+The Entertainment Data Platform uses environment-based configuration with YAML files and environment variables. Each component (Ingestion, Stream Processor, Batch Jobs) has its own configuration structure using Pydantic for type validation.
+
+## Configuration Architecture
+
+<Info>
+All configuration files support environment-specific variants using the `APP_ENV` environment variable (defaults to `dev`).
+</Info>
+
+### Configuration Loading Pattern
+
+All services follow a consistent configuration loading pattern:
+
+```python src/*/config/settings.py
+def load_settings() -> Settings:
+    """
+    Get APP_ENV to get config file and load
+    """
+    env = os.getenv("APP_ENV", "dev")
+    config_path = BASE_DIR / f"config.{env}.yml"
+    
+    logger.info("Loading config with env=%s", env)
+    logger.info("Config path: %s", config_path)
+    
+    if not config_path.exists():
+        logger.error("Config file not found: %s", config_path)
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    
+    logger.info("Load config successfully!")
+    return Settings(**cfg)
+```
+
+### Environment Selection
+
+Set the `APP_ENV` environment variable to select the configuration file:
+
+- `APP_ENV=dev` → loads `config.dev.yml`
+- `APP_ENV=prod` → loads `config.prod.yml`
+
+## Ingestion Service Configuration
+
+The Ingestion service reads raw data files and publishes events to Kafka topics.
+
+### Configuration Structure
+
+```python src/ingestion/config/settings.py
+class TopicSettings(BaseModel):
+    movie: str
+    tv_series: str
+    person: str
+
+class KafkaServerSettings(BaseModel):
+    bootstrap_servers: str
+
+class ProducerSettings(BaseModel):
+    retries: int
+    max_buffer: int
+
+class KafkaSettings(BaseModel):
+    topics: TopicSettings
+    server: KafkaServerSettings
+    producer: ProducerSettings
+
+class Settings(BaseModel):
+    kafka: KafkaSettings
+```
+
+### Example Configuration
+
+```yaml config.dev.yml
+kafka:
+  topics:
+    movie: tmdb.movies.raw
+    tv_series: tmdb.tv_series.raw
+    person: tmdb.people.raw
+  server:
+    bootstrap_servers: localhost:9092
+  producer:
+    retries: 3
+    max_buffer: 10
+```
+
+### Configuration Parameters
+
+<AccordionGroup>
+  <Accordion title="Kafka Topics">
+    | Parameter | Type | Description |
+    |-----------|------|-------------|
+    | `kafka.topics.movie` | string | Kafka topic for movie events |
+    | `kafka.topics.tv_series` | string | Kafka topic for TV series events |
+    | `kafka.topics.person` | string | Kafka topic for person events |
+  </Accordion>
+
+  <Accordion title="Kafka Server">
+    | Parameter | Type | Description |
+    |-----------|------|-------------|
+    | `kafka.server.bootstrap_servers` | string | Kafka broker connection string (host:port) |
+  </Accordion>
+
+  <Accordion title="Producer Settings">
+    | Parameter | Type | Description |
+    |-----------|------|-------------|
+    | `kafka.producer.retries` | int | Number of retry attempts for failed sends |
+    | `kafka.producer.max_buffer` | int | Maximum number of records to buffer before flushing |
+  </Accordion>
+</AccordionGroup>
+
+## Stream Processor Configuration
+
+The Stream Processor consumes Kafka events, validates schemas, and writes to Delta Lake on MinIO.
+
+### Configuration Structure
+
+```python src/stream_processor/config/settings.py
+class KafkaTopicSettings(BaseModel):
+    movie: str
+    tv_series: str
+    person: str
+
+class KafkaServerSettings(BaseModel):
+    bootstrap_servers: str
+
+class StreamSettings(BaseModel):
+    watermark: str
+
+class DeltaLakeSettings(BaseModel):
+    minio_endpoint: str
+    minio_endpoint_sdk: str
+    minio_access_key: str
+    minio_secret_key: str
+    core_bucket: str
+    target_name_folder: DeltaLakeTargetNameFolderSettings
+    tables: DeltaLakeTablesSettings
+    checkpoints: DeltaLakeCheckpointsSettings
+```
+
+### Example Configuration
+
+```yaml config.dev.yml
+sources:
+  kafka:
+    topics:
+      movie: tmdb.movies.raw
+      tv_series: tmdb.tv_series.raw
+      person: tmdb.people.raw
+    server:
+      bootstrap_servers: localhost:9092
+
+stream:
+  watermark: "10 minutes"
+
+sinks:
+  delta_lake:
+    minio_endpoint: "http://localhost:9000"
+    minio_endpoint_sdk: "localhost:9000"
+    minio_access_key: "minio"
+    minio_secret_key: "minio123"
+    core_bucket: "deltalake"
+    target_name_folder:
+      movie: "movies"
+      tv_series: "tvseries"
+      person: "people"
+    tables:
+      valid_base_path: "s3a://deltalake/bronze/valid"
+      invalid_base_path: "s3a://deltalake/bronze/invalid"
+    checkpoints:
+      valid_base_path: "s3a://deltalake/bronze/_checkpoints/_valid"
+      invalid_base_path: "s3a://deltalake/bronze/_checkpoints/_invalid"
+```
+
+### Configuration Parameters
+
+<AccordionGroup>
+  <Accordion title="Stream Settings">
+    | Parameter | Type | Description |
+    |-----------|------|-------------|
+    | `stream.watermark` | string | Watermark delay for late-arriving events (e.g., "10 minutes") |
+  </Accordion>
+
+  <Accordion title="MinIO / Delta Lake Settings">
+    | Parameter | Type | Description |
+    |-----------|------|-------------|
+    | `sinks.delta_lake.minio_endpoint` | string | MinIO HTTP endpoint for Spark (e.g., "http://localhost:9000") |
+    | `sinks.delta_lake.minio_endpoint_sdk` | string | MinIO endpoint for SDK client (e.g., "localhost:9000") |
+    | `sinks.delta_lake.minio_access_key` | string | MinIO access key |
+    | `sinks.delta_lake.minio_secret_key` | string | MinIO secret key |
+    | `sinks.delta_lake.core_bucket` | string | Primary S3 bucket name |
+  </Accordion>
+
+  <Accordion title="Target Folders">
+    | Parameter | Type | Description |
+    |-----------|------|-------------|
+    | `target_name_folder.movie` | string | Folder name for movie data |
+    | `target_name_folder.tv_series` | string | Folder name for TV series data |
+    | `target_name_folder.person` | string | Folder name for person data |
+  </Accordion>
+
+  <Accordion title="Table Paths">
+    | Parameter | Type | Description |
+    |-----------|------|-------------|
+    | `tables.valid_base_path` | string | Base path for valid records (schema-compliant) |
+    | `tables.invalid_base_path` | string | Base path for invalid records (schema violations) |
+  </Accordion>
+
+  <Accordion title="Checkpoint Paths">
+    | Parameter | Type | Description |
+    |-----------|------|-------------|
+    | `checkpoints.valid_base_path` | string | Checkpoint location for valid data streams |
+    | `checkpoints.invalid_base_path` | string | Checkpoint location for invalid data streams |
+  </Accordion>
+</AccordionGroup>
+
+<Warning>
+The Stream Processor creates **two separate streams** for each topic: one for valid records and one for invalid records. Both paths must be configured.
+</Warning>
+
+## Batch Jobs Configuration
+
+The Batch Jobs service orchestrates data transformations between Bronze, Silver, and Gold layers.
+
+### Configuration Structure
+
+```python src/batch_jobs/config/settings.py
+class DeltaLakeSettings(BaseModel):
+    minio_endpoint: str
+    minio_access_key: str
+    minio_secret_key: str
+    target_name_folder: DeltaLakeTargetNameFolderSettings
+    tables: DeltaLakeTablesSettings
+
+class ClickhouseSettings(BaseModel):
+    host: str
+    port: int
+    username: str
+    password: str
+    database: str
+    jdbc_driver: str
+    native_driver: str
+    tables: ClickhouseTablesSettings
+
+class RedisSettings(BaseModel):
+    host: str
+    port: int
+    keys: RedisKeySettings
+
+class Neo4jSettings(BaseModel):
+    url: str
+    username: str
+    password: str
+    database: str
+    instance_id: str
+    instance_name: str
+    batch_size: int
+
+class PineconeSettings(BaseModel):
+    api_key: str
+    index_name: str
+    namespace: PineconeNamespaceSettings
+```
+
+### Example Configuration
+
+```yaml config.dev.yml
+storage:
+  delta_lake:
+    minio_endpoint: "http://localhost:9000"
+    minio_access_key: "minio"
+    minio_secret_key: "minio123"
+    target_name_folder:
+      movie: "movies"
+      tv_series: "tvseries"
+      person: "people"
+    tables:
+      bronze_layer:
+        valid_base_path: "s3a://deltalake/bronze/valid"
+        invalid_base_path: "s3a://deltalake/bronze/invalid"
+      silver_layer:
+        valid_base_path: "s3a://deltalake/silver/valid"
+        invalid_base_path: "s3a://deltalake/silver/invalid"
+
+  clickhouse:
+    host: "localhost"
+    port: 8123
+    username: "default"
+    password: ""
+    jdbc_driver: "com.clickhouse.jdbc.ClickHouseDriver"
+    native_driver: "com.clickhouse.spark.ClickHouseCatalog"
+    database: "silver_layer"
+    tables:
+      movie: "movies"
+      person: "people"
+      tv_series: "tv_series"
+
+  redis:
+    host: "localhost"
+    port: 6379
+    keys:
+      dedup_batch_version: "dedup_batch_version"
+
+  neo4j:
+    url: "neo4j+s://your-instance.databases.neo4j.io"
+    username: "neo4j"
+    password: "your-password"
+    database: "neo4j"
+    instance_id: "your-instance-id"
+    instance_name: "your-instance-name"
+    batch_size: 10
+
+  pinecone:
+    api_key: "your-api-key"
+    index_name: "entertainment-vectors"
+    namespace:
+      movie: "movie_namespace"
+      tv_series: "tv_series_namespace"
+      person: "person_namespace"
+
+spark:
+  app_name_1: "run_dedup_timestamp"
+  app_name_2: "write_to_clickhouse"
+  app_name_3: "write_to_neo4j"
+  app_name_4: "write_to_pinecone"
+```
+
+### Configuration Parameters
+
+<AccordionGroup>
+  <Accordion title="ClickHouse Settings">
+    | Parameter | Type | Description |
+    |-----------|------|-------------|
+    | `storage.clickhouse.host` | string | ClickHouse server hostname |
+    | `storage.clickhouse.port` | int | ClickHouse HTTP port (default: 8123) |
+    | `storage.clickhouse.username` | string | ClickHouse username |
+    | `storage.clickhouse.password` | string | ClickHouse password |
+    | `storage.clickhouse.database` | string | Target database name |
+    | `storage.clickhouse.jdbc_driver` | string | JDBC driver class |
+    | `storage.clickhouse.native_driver` | string | Native Spark driver class |
+  </Accordion>
+
+  <Accordion title="Redis Settings">
+    | Parameter | Type | Description |
+    |-----------|------|-------------|
+    | `storage.redis.host` | string | Redis server hostname |
+    | `storage.redis.port` | int | Redis port (default: 6379) |
+    | `storage.redis.keys.dedup_batch_version` | string | Key prefix for batch version tracking |
+  </Accordion>
+
+  <Accordion title="Neo4j Settings">
+    | Parameter | Type | Description |
+    |-----------|------|-------------|
+    | `storage.neo4j.url` | string | Neo4j connection URL (bolt:// or neo4j+s://) |
+    | `storage.neo4j.username` | string | Neo4j username |
+    | `storage.neo4j.password` | string | Neo4j password |
+    | `storage.neo4j.database` | string | Target database name |
+    | `storage.neo4j.batch_size` | int | Batch size for bulk operations |
+  </Accordion>
+
+  <Accordion title="Pinecone Settings">
+    | Parameter | Type | Description |
+    |-----------|------|-------------|
+    | `storage.pinecone.api_key` | string | Pinecone API key |
+    | `storage.pinecone.index_name` | string | Pinecone index name |
+    | `storage.pinecone.namespace.*` | string | Namespace for each data type |
+  </Accordion>
+</AccordionGroup>
+
+### Environment Variable Override
+
+The Batch Jobs service supports overriding sensitive credentials via environment variables:
+
+```python src/batch_jobs/config/settings.py
+def load_env(cfg):
+    """Load .env to config"""
+    
+    # Neo4j environment variables
+    if os.getenv("NEO4J_URI"):
+        cfg["storage"]["neo4j"]["url"] = os.getenv("NEO4J_URI")
+    
+    if os.getenv("NEO4J_USERNAME"):
+        cfg["storage"]["neo4j"]["username"] = os.getenv("NEO4J_USERNAME")
+    
+    if os.getenv("NEO4J_PASSWORD"):
+        cfg["storage"]["neo4j"]["password"] = os.getenv("NEO4J_PASSWORD")
+    
+    # Pinecone environment variables
+    if os.getenv("PINECONE_API_KEY"):
+        cfg["storage"]["pinecone"]["api_key"] = os.getenv("PINECONE_API_KEY")
+    
+    return cfg
+```
+
+<Tip>
+Use environment variables for production deployments to keep secrets out of configuration files.
+</Tip>
+
+## Logging Configuration
+
+All services use a centralized logging configuration:
+
+```python src/common/logging_config.py
+def setup_logging():
+    """Configure global logging for all services in platform"""
+    
+    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+```
+
+### Log Levels
+
+Set the `LOG_LEVEL` environment variable:
+
+- `DEBUG` - Detailed diagnostic information
+- `INFO` - General informational messages (default)
+- `WARNING` - Warning messages
+- `ERROR` - Error messages
+- `CRITICAL` - Critical errors
+
+Example:
+```bash
+export LOG_LEVEL=DEBUG
+```
+
+## Docker Configuration
+
+Each service has its own Dockerfile with production-ready defaults:
+
+```dockerfile src/batch_jobs/Dockerfile
+FROM python:3.10-slim-bookworm
+
+RUN apt-get update && \
+    apt install -y --no-install-recommends \
+    openjdk-17-jre-headless \
+    curl \
+    procps && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64/
+ENV PYTHONPATH=/app/src
+ENV APP_ENV=prod
+
+COPY src/common ./src/common
+COPY src/batch_jobs ./src/batch_jobs
+```
+
+<Info>
+All Docker containers default to `APP_ENV=prod` and include Java 17 for Spark execution.
+</Info>
+
+## Configuration Best Practices
+
+<Steps>
+  <Step title="Use Environment Variables for Secrets">
+    Never commit API keys, passwords, or connection strings to version control. Use environment variables or secret management systems.
+  </Step>
+  
+  <Step title="Validate Configuration on Startup">
+    The platform uses Pydantic models to validate configuration at startup. Fix validation errors before proceeding.
+  </Step>
+  
+  <Step title="Separate Dev and Prod Configs">
+    Maintain separate `config.dev.yml` and `config.prod.yml` files with appropriate settings for each environment.
+  </Step>
+  
+  <Step title="Document Custom Settings">
+    When adding new configuration parameters, update the Pydantic models and document the new fields.
+  </Step>
+</Steps>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Monitoring" icon="chart-line" href="/operations/monitoring">
+    Learn how to monitor platform health and performance
+  </Card>
+  
+  <Card title="Troubleshooting" icon="wrench" href="/operations/troubleshooting">
+    Common issues and how to resolve them
+  </Card>
+</CardGroup>

@@ -1,0 +1,155 @@
+---
+title: 'Collector'
+description: 'Data collection module for fetching raw entertainment data from TMDB API'
+icon: 'download'
+---
+
+## Overview
+
+The Collector module is responsible for fetching raw entertainment data (Movies, TV Series, and People) from the **TMDB API**. It uses a sophisticated ID-tracking mechanism to differentiate between existing, new, and updated records, enabling incremental data updates.
+
+<Note>
+If you prefer to skip the crawling process, pre-crawled datasets are available on [Kaggle](https://www.kaggle.com/datasets/khoatm2k4/tmdb-craw-dataset) and [HuggingFace](https://huggingface.co/datasets/tmkhoa/tmdb-craw-dataset/tree/main).
+</Note>
+
+## Module Structure
+
+The Collector module is organized into the following directories:
+
+```text
+collector/
+├── craw_api/             # Core crawling logic using TMDB API
+│   └── tmdb/
+│       ├── .env          # API credentials
+│       ├── craw_movie.ipynb
+│       ├── craw_person.ipynb
+│       └── craw_tv_series.ipynb
+├── data/                 # Raw storage for crawled records
+│   ├── id_list/          # ID lists (JSONL) from TMDB daily exports
+│   ├── movie/            # Raw JSONL for Movies
+│   ├── person/           # Raw JSONL for People
+│   └── tv_series/        # Raw JSONL for TV Series
+└── util/                 # Data processing utilities
+    ├── extract_new_id.ipynb    # Logic to identify NEW and CHANGED IDs
+    └── convert_into_batch.ipynb # Re-batching logic for Kaggle optimization
+```
+
+## How It Works
+
+The crawler leverages **TMDB Daily ID Exports** (files provided by TMDB containing all valid IDs up to a specific date) to manage incremental updates.
+
+<Steps>
+
+### ID Diffing & Versioning
+
+The system tracks changes by comparing two snapshots of TMDB ID lists:
+
+- **Baseline**: All IDs from the first snapshot (Dec 2025) are crawled and stored as "Old Data"
+- **Extraction**: The `util/extract_new_id.ipynb` script performs a comparison between the old and new ID lists to determine:
+  - **New IDs**: IDs added to TMDB after the baseline date
+  - **Changed IDs**: Existing IDs that require a re-crawl to capture metadata updates
+
+<Info>
+In this project, the system compares snapshots from 2025-12-31 and 2026-02-02 to track changes over time.
+</Info>
+
+### Crawling Process
+
+The notebooks in `craw_api/tmdb/` read the IDs identified from `data/id_list/`. They fetch full details (metadata, credits, etc.) from the TMDB API and save them as JSONL files in the corresponding `data/` sub-folders.
+
+Each notebook handles a specific entity type:
+- `craw_movie.ipynb` - Fetches movie data
+- `craw_tv_series.ipynb` - Fetches TV series data
+- `craw_person.ipynb` - Fetches person (cast/crew) data
+
+### Kaggle Integration
+
+Due to the large volume of records, crawling is often offloaded to Kaggle.
+
+**The Issue**: Different crawl sessions or worker nodes may produce JSONL files with inconsistent record counts per file.
+
+**The Solution**: `util/convert_into_batch.ipynb` loads these irregular files and redistributes the records into uniform, balanced batches after crawling successfully. This ensures high throughput and stability when the data is eventually pushed to the Spark processing pipeline.
+
+</Steps>
+
+## Data Organization
+
+The Collector stores raw data in three categories:
+
+<CardGroup cols={3}>
+  <Card title="Old Data" icon="folder">
+    Records from the baseline snapshot (Dec 2025)
+  </Card>
+  <Card title="New Data" icon="plus">
+    Records with IDs added after the baseline date
+  </Card>
+  <Card title="Changed Data" icon="rotate">
+    Existing records with updated metadata
+  </Card>
+</CardGroup>
+
+## Quick Start
+
+<Steps>
+
+### Setup API Key
+
+Create a `.env` file in `craw_api/tmdb/`:
+
+```bash
+TMDB_API_KEY_MOVIE=your_movie_api_key
+TMDB_API_KEY_TV_SERIES=your_tv_series_api_key
+TMDB_API_KEY_PERSON=your_person_api_key
+```
+
+### Run Crawler
+
+Open the notebooks in `craw_api/tmdb/` and execute cells sequentially. Each notebook will:
+1. Load the ID list for the entity type
+2. Fetch data from TMDB API
+3. Save records as JSONL files
+
+### Identify Deltas
+
+Use `util/extract_new_id.ipynb` to compare ID lists and identify new/changed IDs for the next crawl cycle.
+
+### Batch Optimization (Optional)
+
+If you crawled data on Kaggle or need to rebalance batches, run `util/convert_into_batch.ipynb` to redistribute records into uniform files.
+
+</Steps>
+
+## Output Format
+
+The Collector outputs raw JSONL files with the following structure:
+
+```json
+{
+  "id": 12345,
+  "title": "Example Movie",
+  "overview": "Movie description...",
+  "release_date": "2026-01-15",
+  "vote_average": 8.5,
+  // ... additional TMDB fields
+}
+```
+
+<Warning>
+The raw data from the Collector is not yet validated or enriched. It requires further processing through the Ingestion and Stream Processing modules.
+</Warning>
+
+## Key Features
+
+- **Incremental Updates**: Only crawl new and changed records, not the entire dataset
+- **ID Tracking**: Sophisticated diffing mechanism to identify data changes
+- **Batch Optimization**: Tools to rebalance data files for optimal processing
+- **Kaggle Support**: Designed for large-scale crawling on Kaggle infrastructure
+- **Three Entity Types**: Supports Movies, TV Series, and People data
+
+## Next Steps
+
+After collecting raw data, the next step is to ingest it into the streaming pipeline:
+
+<Card title="Ingestion" icon="right" href="/components/ingestion">
+  Learn how the Ingestion module processes and publishes collected data to Kafka
+</Card>

@@ -1,0 +1,607 @@
+---
+title: 'Stream Processor API'
+description: 'API reference for real-time stream processing with Spark and Kafka'
+---
+
+## Overview
+
+The Stream Processor service consumes events from Kafka topics, validates and enriches them with PySpark, and writes the processed data to Delta Lake tables in MinIO storage. It provides real-time data quality checks and separates valid from invalid records.
+
+## Core Components
+
+### Main Entry Point
+
+<ParamField path="run_stream" type="function">
+  Main entry point that sets up Spark streaming from Kafka to Delta Lake.
+
+  **Location**: `src/stream_processor/main.py:22`
+
+  **Process Flow**:
+  1. Loads configuration and sets up logging
+  2. Creates MinIO bucket if needed
+  3. Initializes Spark session with Delta Lake support
+  4. Creates streaming queries for each Kafka topic
+  5. Processes events and splits into valid/invalid streams
+  6. Writes to separate Delta Lake tables
+  7. Awaits termination of all queries
+</ParamField>
+
+### Configuration Management
+
+<ResponseField name="Settings" type="BaseModel">
+  Main configuration model for the stream processor.
+
+  **Location**: `src/stream_processor/config/settings.py:58`
+</ResponseField>
+
+<Expandable title="Settings Structure">
+  <ParamField path="sources" type="SourcesSettings">
+    Configuration for data sources (Kafka)
+  </ParamField>
+  
+  <ParamField path="stream" type="StreamSettings">
+    Streaming-specific settings
+  </ParamField>
+  
+  <ParamField path="sinks" type="SinksSettings">
+    Configuration for data sinks (Delta Lake)
+  </ParamField>
+</Expandable>
+
+#### Source Configuration
+
+<ResponseField name="SourcesSettings" type="BaseModel">
+  <Expandable title="properties">
+    <ParamField path="kafka" type="KafkaSettings">
+      Kafka source configuration
+      
+      <Expandable title="kafka properties">
+        <ParamField path="topics" type="KafkaTopicSettings">
+          Topic names for movie, tv_series, person
+        </ParamField>
+        <ParamField path="server" type="KafkaServerSettings">
+          Bootstrap servers address
+        </ParamField>
+      </Expandable>
+    </ParamField>
+  </Expandable>
+</ResponseField>
+
+#### Sink Configuration
+
+<ResponseField name="SinksSettings" type="BaseModel">
+  <Expandable title="properties">
+    <ParamField path="delta_lake" type="DeltaLakeSettings">
+      Delta Lake configuration
+      
+      <Expandable title="delta_lake properties">
+        <ParamField path="minio_endpoint" type="str">
+          MinIO endpoint for Spark (e.g., http://minio:9000)
+        </ParamField>
+        <ParamField path="minio_endpoint_sdk" type="str">
+          MinIO endpoint for SDK client
+        </ParamField>
+        <ParamField path="minio_access_key" type="str">
+          MinIO access key
+        </ParamField>
+        <ParamField path="minio_secret_key" type="str">
+          MinIO secret key
+        </ParamField>
+        <ParamField path="core_bucket" type="str">
+          Bucket name for Delta tables
+        </ParamField>
+        <ParamField path="target_name_folder" type="DeltaLakeTargetNameFolderSettings">
+          Folder names for each data type
+        </ParamField>
+        <ParamField path="tables" type="DeltaLakeTablesSettings">
+          Base paths for valid and invalid tables
+        </ParamField>
+        <ParamField path="checkpoints" type="DeltaLakeCheckpointsSettings">
+          Base paths for valid and invalid checkpoints
+        </ParamField>
+      </Expandable>
+    </ParamField>
+  </Expandable>
+</ResponseField>
+
+<ParamField path="load_settings" type="function" returnType="Settings">
+  Loads configuration from YAML file based on APP_ENV.
+
+  **Location**: `src/stream_processor/config/settings.py:63`
+
+  **Environment Variables**:
+  - `APP_ENV`: Environment name (defaults to "dev")
+
+  **Returns**: Validated Settings object
+</ParamField>
+
+### Kafka Source
+
+<ParamField path="read_kafka_stream" type="function" returnType="DataFrame">
+  Creates a Spark structured streaming DataFrame from Kafka topic.
+
+  **Location**: `src/stream_processor/sources/kafka_source.py:9`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="spark" type="SparkSession" required>
+      Active Spark session
+    </ParamField>
+    <ParamField path="settings" type="Settings" required>
+      Application settings
+    </ParamField>
+    <ParamField path="topic" type="str" required>
+      Kafka topic to subscribe to
+    </ParamField>
+  </Expandable>
+
+  **Returns**: Streaming DataFrame with Kafka message schema
+
+  **Configuration**:
+  - `startingOffsets`: "latest" (only new messages)
+  - `isolation.level`: "read_committed"
+  - Format: "kafka"
+</ParamField>
+
+### Event Processing
+
+<ParamField path="process_event" type="function" returnType="DataFrame">
+  Complete event processing pipeline: cast, enrich, and validate.
+
+  **Location**: `src/stream_processor/processor/event_processor.py:10`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="df" type="DataFrame" required>
+      Raw streaming DataFrame from Kafka
+    </ParamField>
+  </Expandable>
+
+  **Returns**: DataFrame with processed events and `valid_schema` boolean column
+
+  **Processing Steps**:
+  1. `cast_event()`: Parse JSON from Kafka value
+  2. `enrich_event()`: Add process_timestamp
+  3. `valid_full_schema()`: Validate and add valid_schema flag
+</ParamField>
+
+<ParamField path="cast_event" type="function" returnType="DataFrame">
+  Casts Kafka byte array to string and parses JSON.
+
+  **Location**: `src/stream_processor/processor/event_processor.py:20`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="df" type="DataFrame" required>
+      Raw Kafka DataFrame
+    </ParamField>
+  </Expandable>
+
+  **Returns**: DataFrame with parsed columns and `raw_df` field
+
+  **Schema**: Uses `PARTIAL_EVENT_SCHEMA` for initial parsing
+</ParamField>
+
+<ParamField path="enrich_event" type="function" returnType="DataFrame">
+  Enriches events with processing timestamp.
+
+  **Location**: `src/stream_processor/processor/event_processor.py:51`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="df" type="DataFrame" required>
+      DataFrame with parsed events
+    </ParamField>
+  </Expandable>
+
+  **Returns**: DataFrame with `process_timestamp` as first column
+
+  **Added Fields**:
+  - `process_timestamp`: Current timestamp when event was processed
+</ParamField>
+
+<ParamField path="valid_full_schema" type="function" returnType="DataFrame">
+  Validates schema and extracts ID from the appropriate field.
+
+  **Location**: `src/stream_processor/processor/event_processor.py:30`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="df" type="DataFrame" required>
+      DataFrame with enriched events
+    </ParamField>
+  </Expandable>
+
+  **Returns**: DataFrame with validation results
+
+  **Added Fields**:
+  - `id_of_data_type`: Extracted ID (from person_id, movie_id, or tv_series_id)
+  - `valid_schema`: Boolean indicating if all required fields are present
+
+  **Validation Rules**:
+  Record is valid if ALL of these are NOT NULL:
+  - `data_type`
+  - `data_label`
+  - `timestamp`
+  - `process_timestamp`
+  - `id_of_data_type`
+</ParamField>
+
+### Delta Lake Sink
+
+<ParamField path="delta_lake_sink" type="function" returnType="StreamingQuery">
+  Creates a single streaming write to Delta Lake table.
+
+  **Location**: `src/stream_processor/sinks/delta_lake_sink.py:8`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="df" type="DataFrame" required>
+      Streaming DataFrame to write
+    </ParamField>
+    <ParamField path="table" type="str" required>
+      Delta table path (s3a://bucket/path)
+    </ParamField>
+    <ParamField path="checkpoint" type="str" required>
+      Checkpoint location for fault tolerance
+    </ParamField>
+  </Expandable>
+
+  **Returns**: Active streaming query
+
+  **Write Mode**: Append
+
+  **Features**:
+  - Micro-batch processing with logging
+  - Checkpoint-based fault tolerance
+  - Delta Lake ACID guarantees
+</ParamField>
+
+<ParamField path="delta_lake_sink_dql" type="function" returnType="Tuple[StreamingQuery, StreamingQuery]">
+  Creates two streaming writes: one for valid events, one for invalid.
+
+  **Location**: `src/stream_processor/sinks/delta_lake_sink.py:41`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="df" type="DataFrame" required>
+      DataFrame with `valid_schema` column
+    </ParamField>
+    <ParamField path="valid_table" type="str" required>
+      Delta table path for valid records
+    </ParamField>
+    <ParamField path="invalid_table" type="str" required>
+      Delta table path for invalid records
+    </ParamField>
+    <ParamField path="valid_checkpoint" type="str" required>
+      Checkpoint path for valid stream
+    </ParamField>
+    <ParamField path="invalid_checkpoint" type="str" required>
+      Checkpoint path for invalid stream
+    </ParamField>
+  </Expandable>
+
+  **Returns**: Tuple of (valid_query, invalid_query)
+
+  **Behavior**:
+  - Valid records: `valid_schema == True`, drops validation column
+  - Invalid records: `valid_schema == False`, keeps all columns
+</ParamField>
+
+<ParamField path="split_valid_invalid_stream" type="function" returnType="Tuple[DataFrame, DataFrame]">
+  Splits DataFrame into valid and invalid streams based on schema validation.
+
+  **Location**: `src/stream_processor/sinks/delta_lake_sink.py:33`
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="df" type="DataFrame" required>
+      DataFrame with `valid_schema` boolean column
+    </ParamField>
+  </Expandable>
+
+  **Returns**: Tuple of (valid_df, invalid_df)
+</ParamField>
+
+### MinIO Client
+
+<ResponseField name="MinioClient" type="class">
+  MinIO client wrapper for bucket management.
+
+  **Location**: `src/stream_processor/runtime/minio_client.py`
+</ResponseField>
+
+<ParamField path="make_bucket_if_not_exists" type="method">
+  Creates MinIO bucket if it doesn't already exist.
+
+  **Parameters**:
+  <Expandable title="parameters">
+    <ParamField path="bucket_name" type="str" required>
+      Name of bucket to create
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+## Usage Examples
+
+### Running the Stream Processor
+
+```python
+from stream_processor.main import run_stream
+
+# Start streaming from Kafka to Delta Lake
+run_stream()
+```
+
+The service will:
+- Create Spark session
+- Subscribe to Kafka topics
+- Process events in micro-batches
+- Write to Delta Lake tables
+- Run indefinitely until terminated
+
+### Reading from Kafka
+
+```python
+from pyspark.sql import SparkSession
+from stream_processor.config.settings import load_settings
+from stream_processor.sources.kafka_source import read_kafka_stream
+
+# Initialize
+settings = load_settings()
+spark = SparkSession.builder.appName("KafkaReader").getOrCreate()
+
+# Read stream
+df = read_kafka_stream(
+    spark=spark,
+    settings=settings,
+    topic="movie-events"
+)
+
+# Show schema
+df.printSchema()
+```
+
+### Processing Events
+
+```python
+from stream_processor.processor.event_processor import process_event
+
+# Read from Kafka
+raw_df = read_kafka_stream(spark, settings, "movie-events")
+
+# Process: parse, enrich, validate
+processed_df = process_event(raw_df)
+
+# Check schema
+processed_df.printSchema()
+# Contains: process_timestamp, data_type, data_label, timestamp, 
+#          id_of_data_type, valid_schema, raw_df, ...
+```
+
+### Writing to Delta Lake
+
+```python
+from stream_processor.sinks.delta_lake_sink import delta_lake_sink_dql
+
+# Split and write valid/invalid events
+valid_query, invalid_query = delta_lake_sink_dql(
+    df=processed_df,
+    valid_table="s3a://bronze/movie/valid",
+    invalid_table="s3a://bronze/movie/invalid",
+    valid_checkpoint="s3a://checkpoints/movie/valid",
+    invalid_checkpoint="s3a://checkpoints/movie/invalid"
+)
+
+# Queries are now running
+print(f"Valid query: {valid_query.status}")
+print(f"Invalid query: {invalid_query.status}")
+
+# Wait for termination (blocks)
+valid_query.awaitTermination()
+```
+
+### Custom Event Processing
+
+```python
+from pyspark.sql.functions import col, when, length
+
+# Process events
+processed_df = process_event(raw_df)
+
+# Add custom validation
+enhanced_df = processed_df.withColumn(
+    "has_overview",
+    when(length(col("overview")) > 10, True).otherwise(False)
+)
+
+# Filter before writing
+quality_df = enhanced_df.filter(
+    (col("valid_schema") == True) & 
+    (col("has_overview") == True)
+)
+```
+
+## Configuration Example
+
+```yaml
+# config.dev.yml
+sources:
+  kafka:
+    topics:
+      movie: "movie-events"
+      tv_series: "tv-series-events"
+      person: "person-events"
+    server:
+      bootstrap_servers: "localhost:9092"
+
+stream:
+  watermark: "10 seconds"
+
+sinks:
+  delta_lake:
+    minio_endpoint: "http://localhost:9000"
+    minio_endpoint_sdk: "localhost:9000"
+    minio_access_key: "minioadmin"
+    minio_secret_key: "minioadmin"
+    core_bucket: "bronze"
+    
+    target_name_folder:
+      movie: "movie"
+      person: "person"
+      tv_series: "tv_series"
+    
+    tables:
+      valid_base_path: "s3a://bronze/tables/valid"
+      invalid_base_path: "s3a://bronze/tables/invalid"
+    
+    checkpoints:
+      valid_base_path: "s3a://bronze/checkpoints/valid"
+      invalid_base_path: "s3a://bronze/checkpoints/invalid"
+```
+
+## Spark Configuration
+
+The stream processor configures Spark with:
+
+```python
+SparkSession.builder \
+    .appName("KafkaStreamToDelta") \
+    .master("local[*]") \
+    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
+    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
+    .config("spark.databricks.delta.properties.defaults.enableChangeDataFeed", "true") \
+    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+    .config("spark.hadoop.fs.s3a.endpoint", settings.sinks.delta_lake.minio_endpoint) \
+    .config("spark.hadoop.fs.s3a.access.key", settings.sinks.delta_lake.minio_access_key) \
+    .config("spark.hadoop.fs.s3a.secret.key", settings.sinks.delta_lake.minio_secret_key) \
+    .config("spark.hadoop.fs.s3a.path.style.access", "true")
+```
+
+**Key Features**:
+- Delta Lake extensions enabled
+- Change Data Feed (CDF) enabled for all tables
+- S3A filesystem for MinIO access
+- Path-style access for MinIO compatibility
+
+## Data Flow
+
+<Steps>
+  <Step title="Consume from Kafka">
+    `read_kafka_stream()` creates streaming DataFrame from topic
+  </Step>
+  
+  <Step title="Parse JSON">
+    `cast_event()` converts byte array to structured data
+  </Step>
+  
+  <Step title="Enrich">
+    `enrich_event()` adds process_timestamp
+  </Step>
+  
+  <Step title="Validate">
+    `valid_full_schema()` checks required fields and adds validation flag
+  </Step>
+  
+  <Step title="Split Streams">
+    `split_valid_invalid_stream()` separates valid from invalid records
+  </Step>
+  
+  <Step title="Write to Delta Lake">
+    `delta_lake_sink()` writes both streams to separate tables
+  </Step>
+</Steps>
+
+## Event Schema
+
+### Input (from Kafka)
+
+```
+value: binary (JSON string)
+key: binary
+topic: string
+partition: int
+offset: long
+timestamp: timestamp
+```
+
+### Output (to Delta Lake - Valid)
+
+```
+process_timestamp: timestamp
+data_type: string (movie/tv_series/person)
+data_label: string (old/new/change)
+timestamp: timestamp
+id_of_data_type: long
+[additional fields from source data]
+```
+
+### Output (to Delta Lake - Invalid)
+
+Same as valid, plus:
+```
+valid_schema: boolean (always false)
+raw_df: string (original JSON)
+```
+
+## Performance Tuning
+
+<Tip>
+**Batch Size**: Controlled by Spark's `spark.sql.streaming.trigger` (default: as soon as possible)
+
+**Parallelism**: Set by `master("local[*]")` - uses all available cores
+
+**Checkpointing**: Essential for fault tolerance; stored in MinIO
+
+**Memory**: Adjust `spark.driver.memory` and `spark.executor.memory` for larger workloads
+</Tip>
+
+## Monitoring
+
+Monitor streaming queries:
+
+```python
+# Get query status
+query.status
+
+# Recent progress
+query.recentProgress
+
+# Last progress
+query.lastProgress
+
+# Exception if failed
+query.exception()
+```
+
+## Error Handling
+
+<Warning>
+**Kafka Connection Failures**: Spark will retry based on Kafka client configuration
+
+**Schema Mismatches**: Records fail validation and go to invalid table
+
+**MinIO Unavailable**: Stream stops; restart from checkpoint when available
+
+**Malformed JSON**: Caught during cast_event; record marked invalid
+</Warning>
+
+## Best Practices
+
+1. **Always enable checkpointing** for production workloads
+2. **Monitor invalid table** for data quality issues
+3. **Use Change Data Feed** for downstream processing
+4. **Set appropriate trigger intervals** based on latency requirements
+5. **Configure Kafka consumer groups** for parallel processing
+
+## Related APIs
+
+<CardGroup cols={2}>
+  <Card title="Ingestion API" icon="filter" href="/api/ingestion">
+    Produces Kafka events consumed by stream processor
+  </Card>
+  
+  <Card title="Batch Jobs" icon="gears" href="/api/batch-jobs">
+    Processes Delta Lake tables created by streaming
+  </Card>
+</CardGroup>

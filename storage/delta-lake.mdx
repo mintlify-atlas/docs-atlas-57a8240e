@@ -1,0 +1,612 @@
+---
+title: 'Delta Lake'
+description: 'ACID transactions, schema evolution, and time travel for the Entertainment Data Platform'
+icon: 'database'
+---
+
+## Overview
+
+Delta Lake provides the **storage foundation** for the Entertainment Data Platform's Medallion Architecture. It brings reliability, performance, and advanced features to data lake storage, enabling ACID transactions on object storage (MinIO) and powering both Bronze and Silver layers.
+
+<Info>
+Delta Lake transforms ordinary Parquet files on object storage into reliable, versioned tables with database-like guarantees.
+</Info>
+
+## Why Delta Lake?
+
+The platform chose Delta Lake to solve critical data engineering challenges:
+
+<CardGroup cols={2}>
+  <Card title="ACID Transactions" icon="shield-check">
+    Prevent partial writes and ensure data consistency across concurrent operations
+  </Card>
+  <Card title="Schema Evolution" icon="code-branch">
+    Handle schema changes without breaking existing pipelines
+  </Card>
+  <Card title="Time Travel" icon="clock-rotate-left">
+    Query historical versions and audit data changes over time
+  </Card>
+  <Card title="Unified Batch & Streaming" icon="water">
+    Single storage format for both Spark Streaming and batch jobs
+  </Card>
+  <Card title="Change Data Feed" icon="rss">
+    Efficiently read only incremental changes between versions
+  </Card>
+  <Card title="Upsert Operations" icon="arrows-rotate">
+    Native MERGE support for handling updates and late-arriving data
+  </Card>
+</CardGroup>
+
+## Core Concepts
+
+### Transaction Log
+
+Delta Lake maintains an ordered transaction log in the `_delta_log` directory:
+
+```
+s3://bucket/bronze/movies/
+├── _delta_log/
+│   ├── 00000000000000000000.json
+│   ├── 00000000000000000001.json
+│   ├── 00000000000000000002.json
+│   └── ...
+└── part-00000-*.parquet
+```
+
+Each JSON file represents a single atomic transaction:
+
+```json
+{
+  "commitInfo": {
+    "timestamp": 1678901234567,
+    "operation": "WRITE",
+    "operationMetrics": {
+      "numFiles": "1",
+      "numOutputRows": "1523"
+    }
+  },
+  "add": {
+    "path": "part-00000-abc123.parquet",
+    "size": 987654,
+    "partitionValues": {},
+    "modificationTime": 1678901234567,
+    "dataChange": true,
+    "stats": "{...}"
+  }
+}
+```
+
+<Note>
+The transaction log provides atomic commits, concurrent reads/writes, and versioned snapshots - the foundation of Delta Lake's reliability.
+</Note>
+
+### Versioning
+
+Every write operation creates a new version:
+
+```python
+# Check table history
+delta_table = DeltaTable.forPath(spark, "s3a://bucket/silver/movies")
+history = delta_table.history()
+history.select("version", "timestamp", "operation", "operationMetrics").show()
+
+# Output:
+# +-------+-------------------+---------+--------------------+
+# |version|          timestamp|operation|   operationMetrics |
+# +-------+-------------------+---------+--------------------+
+# |      5|2024-03-15 10:30:00|    MERGE|{numTargetRowsUp...}|
+# |      4|2024-03-15 09:15:00|    MERGE|{numTargetRowsIn...}|
+# |      3|2024-03-15 08:00:00|   WRITE |{numFiles: 10, n...}|
+# +-------+-------------------+---------+--------------------+
+```
+
+## Delta Lake in Bronze Layer
+
+The Bronze Layer uses Delta Lake for streaming writes from Kafka:
+
+### Streaming Write Configuration
+
+```python
+def delta_lake_sink(
+    df: DataFrame,
+    table: str,
+    checkpoint: str
+):
+    """
+    Create a single write stream to Delta Lake.
+    """
+    def log_batch(batch_df, batch_id):
+        logger.info("Batch %s count=%s", batch_id, batch_df.count())
+        batch_df.write \
+            .format("delta") \
+            .mode("append") \
+            .save(table)
+
+    return (
+        df.writeStream \
+            .format("delta") \
+            .outputMode("append") \
+            .option("checkpointLocation", checkpoint) \
+            .foreachBatch(log_batch)
+            .start(table)
+    )
+```
+
+<Tip>
+**Checkpoint Location**: The checkpoint directory stores offset information, enabling exactly-once processing and fault tolerance. Never delete checkpoints while a streaming query is active.
+</Tip>
+
+### Append-Only Pattern
+
+Bronze tables use append-only writes:
+
+- **Immutability**: Raw events never modified
+- **Audit trail**: Complete history preserved
+- **Replay capability**: Can reprocess from any point
+- **Performance**: Append is fastest write operation
+
+## Delta Lake in Silver Layer
+
+The Silver Layer leverages Delta Lake's advanced features:
+
+### MERGE (Upsert) Operations
+
+The core of Silver Layer deduplication:
+
+```python
+# Initialize table with CDF enabled
+if not DeltaTable.isDeltaTable(spark, to_folder):
+    (
+        hashed_df.limit(0)
+            .write
+            .format("delta")
+            .mode("overwrite")
+            .option("delta.enableChangeDataFeed", "true")
+            .save(to_folder)
+    )
+
+# Perform MERGE operation
+target_delta_table = DeltaTable.forPath(spark, to_folder)
+merge_condition = " AND ".join([f"t.{col} = s.{col}" for col in key_columns])
+update_condition = f"s.{ts_column} > t.{ts_column}"
+
+(
+    target_delta_table.alias("t")
+        .merge(
+            source=final_source_df.alias("s"),
+            condition=merge_condition,
+        )
+        .whenMatchedUpdateAll(condition=update_condition)
+        .whenNotMatchedInsertAll()
+        .execute()
+)
+```
+
+### MERGE Semantics Breakdown
+
+<Steps>
+  <Step title="Match Condition">
+    Join source and target on key columns (data_type, id_of_data_type)
+  </Step>
+  <Step title="Matched + Newer Timestamp">
+    If record exists and source timestamp > target timestamp, UPDATE all columns
+  </Step>
+  <Step title="Matched + Older Timestamp">
+    If record exists but source timestamp ≤ target timestamp, SKIP (no update)
+  </Step>
+  <Step title="Not Matched">
+    If record doesn't exist in target, INSERT new row
+  </Step>
+  <Step title="Atomic Commit">
+    Entire operation commits as single transaction or rolls back completely
+  </Step>
+</Steps>
+
+<Warning>
+MERGE operations require careful condition design. Always include a timestamp or version check in the update condition to prevent older data from overwriting newer records.
+</Warning>
+
+### Change Data Feed (CDF)
+
+CDF tracks all changes to Delta tables:
+
+```python
+def read_table_cdf(
+        self,
+        target_path: str,
+        start_timestamp: str | None = None,
+        end_timestamp: str | None = None,
+        start_version: int | None = None,
+        end_version: int | None = None
+):
+    """
+    Read table from Delta with Change Data Feed
+    """
+    reader = self.spark.read.format("delta") \
+                    .option("readChangeFeed", "true")
+    
+    if start_timestamp is not None:
+        reader = reader.option("startingTimestamp", start_timestamp)
+    if end_timestamp is not None:
+        reader = reader.option("endingTimestamp", end_timestamp)
+    if start_version is not None:
+        reader = reader.option("startingVersion", start_version)
+    if end_version is not None:
+        reader = reader.option("endingVersion", end_version)
+    
+    return reader.load(target_path)
+```
+
+#### CDF Output Schema
+
+CDF adds metadata columns to track changes:
+
+```
+Columns:
+├── [all original columns]
+├── _change_type: string  # insert, update_preimage, update_postimage, delete
+├── _commit_version: long # Delta version that made the change
+└── _commit_timestamp: timestamp # When the change was committed
+```
+
+#### CDF Use Cases in Platform
+
+1. **Incremental Bronze to Silver**: Only process new Bronze records
+2. **Audit trails**: Track who changed what and when
+3. **CDC pipelines**: Propagate changes to downstream systems
+4. **Debugging**: Understand data evolution over time
+
+<Info>
+**Performance**: CDF reads only the changed records between versions, not the entire table. This dramatically reduces data scanning for incremental batch jobs.
+</Info>
+
+### Schema Evolution
+
+Delta Lake handles schema changes gracefully:
+
+```python
+# Enable schema evolution
+df.write \
+    .format("delta") \
+    .mode("append") \
+    .option("mergeSchema", "true") \
+    .save(table_path)
+```
+
+**Supported Evolution**:
+- Adding new columns (nullable)
+- Changing column comments
+- Reordering columns
+
+**Not Supported**:
+- Dropping columns
+- Changing column types
+- Renaming columns (must use ALTER TABLE)
+
+## Delta Lake Readers and Writers
+
+The platform provides abstraction classes for Delta operations:
+
+### Reader Implementation
+
+```python
+class DeltaMinioReader:
+    """
+    Create Delta table reader from Minio by Spark
+    """
+    def __init__(self, spark: SparkSession):
+        self.spark = spark
+        self.settings = load_settings()
+    
+    def read_table(self, target_path: str):
+        """
+        Read table from Delta
+        """
+        return self.spark.read.format("delta").load(target_path)
+    
+    def read_table_with_filters(self, target_path: str, filters: dict):
+        """
+        Read table from Delta with filters
+        """
+        df = self.read_table(target_path)
+        if not filters:
+            return df
+        
+        target_df = reduce(
+            lambda temp_df, item: temp_df.filter(col(item[0]) == item[1]),
+            filters.items(),
+            df
+        )
+        return target_df
+```
+
+### Writer Implementation
+
+```python
+class DeltaMinioWriter:
+    """
+    Create Delta table writer from Minio by Spark
+    """
+    def __init__(self, spark: SparkSession):
+        self.spark = spark
+    
+    def overwrite(self, df: DataFrame, target_path: str):
+        """
+        Write table to Delta with overwrite mode
+        """
+        return df.write.format("delta").mode("overwrite").save(target_path)
+    
+    def append(self, df: DataFrame, target_path: str):
+        """
+        Write table to Delta with append mode
+        """
+        return df.write.format("delta").mode("append").save(target_path)
+    
+    def write_first_with_cdf(self, df: DataFrame, target_path: str):
+        """
+        Write table to Delta with overwrite mode and enable Change Data Feed
+        """
+        return df.write.format("delta").mode("overwrite") \
+                   .option("delta.enableChangeDataFeed", "true") \
+                   .save(target_path)
+```
+
+## Configuration and Optimization
+
+### MinIO Integration
+
+Delta Lake on MinIO requires proper Spark configuration:
+
+```python
+# S3A connector configuration
+spark.conf.set("spark.hadoop.fs.s3a.endpoint", "http://minio:9000")
+spark.conf.set("spark.hadoop.fs.s3a.access.key", "minioadmin")
+spark.conf.set("spark.hadoop.fs.s3a.secret.key", "minioadmin")
+spark.conf.set("spark.hadoop.fs.s3a.path.style.access", "true")
+spark.conf.set("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+
+# Delta Lake extensions
+spark.conf.set("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+spark.conf.set("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+```
+
+### Performance Tuning
+
+<CardGroup cols={2}>
+  <Card title="File Size" icon="file">
+    Target 128MB-1GB Parquet files for optimal read performance
+  </Card>
+  <Card title="Compaction" icon="compress">
+    Regularly OPTIMIZE tables to merge small files
+  </Card>
+  <Card title="Z-Ordering" icon="arrow-down-z-a">
+    Use ZORDER BY on frequently filtered columns
+  </Card>
+  <Card title="Vacuum" icon="broom">
+    Clean up old versions to reduce storage costs
+  </Card>
+</CardGroup>
+
+### Compaction Example
+
+```python
+# Compact small files
+delta_table = DeltaTable.forPath(spark, "s3a://bucket/silver/movies")
+delta_table.optimize().executeCompaction()
+
+# Z-order by commonly filtered columns
+delta_table.optimize().where("release_date >= '2020-01-01'") \
+    .executeZOrderBy("data_type", "release_date")
+```
+
+<Tip>
+Run OPTIMIZE after heavy write periods (e.g., after processing a large batch) to maintain query performance.
+</Tip>
+
+### Retention and Vacuum
+
+```python
+# Set retention period (default: 7 days)
+spark.conf.set("spark.databricks.delta.retentionDurationCheck.enabled", "false")
+
+# Remove files older than retention period
+delta_table.vacuum(168)  # 168 hours = 7 days
+
+# CAUTION: Time travel won't work beyond vacuumed versions
+```
+
+<Warning>
+VACUUM permanently deletes old files. Ensure no downstream processes need historical versions before running. Never vacuum files younger than your longest-running job.
+</Warning>
+
+## Time Travel
+
+Query historical table versions:
+
+```python
+# Read specific version
+df_v3 = spark.read.format("delta") \
+    .option("versionAsOf", 3) \
+    .load("s3a://bucket/silver/movies")
+
+# Read as of timestamp
+df_yesterday = spark.read.format("delta") \
+    .option("timestampAsOf", "2024-03-14 00:00:00") \
+    .load("s3a://bucket/silver/movies")
+
+# Compare two versions
+df_current = spark.read.format("delta").load("s3a://bucket/silver/movies")
+df_previous = spark.read.format("delta").option("versionAsOf", 10).load("s3a://bucket/silver/movies")
+
+# Find differences
+changed = df_current.subtract(df_previous)
+changed.show()
+```
+
+### Time Travel Use Cases
+
+<CardGroup cols={2}>
+  <Card title="Debugging" icon="bug">
+    Investigate when data quality issues were introduced
+  </Card>
+  <Card title="Auditing" icon="clipboard-check">
+    Verify data state at specific points in time
+  </Card>
+  <Card title="Rollback" icon="clock-rotate-left">
+    Restore table to previous good state after bad write
+  </Card>
+  <Card title="Comparison" icon="code-compare">
+    Analyze data evolution between versions
+  </Card>
+</CardGroup>
+
+## Table Properties
+
+Configure Delta table behavior:
+
+```python
+# Enable Change Data Feed
+spark.sql("""
+    ALTER TABLE delta.`s3a://bucket/silver/movies`
+    SET TBLPROPERTIES (delta.enableChangeDataFeed = true)
+""")
+
+# Set data retention
+spark.sql("""
+    ALTER TABLE delta.`s3a://bucket/silver/movies`
+    SET TBLPROPERTIES (delta.deletedFileRetentionDuration = 'interval 30 days')
+""")
+
+# Adjust log retention
+spark.sql("""
+    ALTER TABLE delta.`s3a://bucket/silver/movies`
+    SET TBLPROPERTIES (delta.logRetentionDuration = 'interval 90 days')
+""")
+```
+
+### Important Properties
+
+| Property | Default | Purpose |
+|----------|---------|----------|
+| `delta.enableChangeDataFeed` | false | Enable CDF for incremental reads |
+| `delta.deletedFileRetentionDuration` | 7 days | How long to keep old Parquet files |
+| `delta.logRetentionDuration` | 30 days | How long to keep transaction logs |
+| `delta.autoOptimize.optimizeWrite` | false | Automatically optimize file sizes on write |
+| `delta.autoOptimize.autoCompact` | false | Automatically compact small files |
+
+## Monitoring and Troubleshooting
+
+### Table Details
+
+```python
+# Get table info
+delta_table = DeltaTable.forPath(spark, "s3a://bucket/silver/movies")
+detail = delta_table.detail()
+detail.select("format", "numFiles", "sizeInBytes", "partitionColumns").show()
+
+# View transaction history
+history = delta_table.history()
+history.select(
+    "version", "timestamp", "operation", 
+    "operationMetrics.numFiles", "operationMetrics.numOutputRows"
+).show(20)
+```
+
+### Common Issues and Solutions
+
+<Accordion title="AnalysisException: Table not found">
+**Cause**: Path doesn't contain a Delta table (_delta_log missing)
+
+**Solution**: Verify the path is correct and has been initialized:
+```python
+if not DeltaTable.isDeltaTable(spark, path):
+    # Initialize the table
+    df.write.format("delta").mode("overwrite").save(path)
+```
+</Accordion>
+
+<Accordion title="ConcurrentAppendException">
+**Cause**: Concurrent writes with conflicting transactions
+
+**Solution**: This is rare with Delta's optimistic concurrency. If it occurs, retry the operation. Delta automatically handles most concurrent writes.
+</Accordion>
+
+<Accordion title="Slow MERGE operations">
+**Cause**: Large number of small files or missing file statistics
+
+**Solution**: 
+```python
+# Compact the table
+delta_table.optimize().executeCompaction()
+
+# Z-order by merge key columns
+delta_table.optimize().executeZOrderBy("data_type", "id_of_data_type")
+```
+</Accordion>
+
+<Accordion title="High storage costs">
+**Cause**: Old versions accumulating without cleanup
+
+**Solution**:
+```python
+# Regularly vacuum old files
+delta_table.vacuum(168)  # Keep 7 days of history
+```
+</Accordion>
+
+## Best Practices
+
+<Steps>
+  <Step title="Enable CDF for Silver tables">
+    Always enable Change Data Feed on Silver Layer tables to support incremental processing
+  </Step>
+  <Step title="Use MERGE for upserts">
+    Leverage Delta's MERGE for handling updates and deduplication with proper timestamp conditions
+  </Step>
+  <Step title="Version tracking">
+    Store last processed version in external metadata store (Redis) for incremental pipelines
+  </Step>
+  <Step title="Regular maintenance">
+    Schedule OPTIMIZE and VACUUM operations during low-traffic periods
+  </Step>
+  <Step title="Monitor table health">
+    Track number of files, table size, and operation metrics over time
+  </Step>
+  <Step title="Test time travel">
+    Verify retention periods align with recovery requirements
+  </Step>
+</Steps>
+
+## Delta Lake vs Alternatives
+
+| Feature | Delta Lake | Parquet | Hudi | Iceberg |
+|---------|-----------|---------|------|----------|
+| ACID Transactions | ✅ | ❌ | ✅ | ✅ |
+| Upsert/Merge | ✅ | ❌ | ✅ | ✅ |
+| Time Travel | ✅ | ❌ | ✅ | ✅ |
+| Change Data Feed | ✅ | ❌ | ✅ (CDC) | ❌ |
+| Streaming Writes | ✅ | ✅ | ✅ | ⚠️ |
+| Schema Evolution | ✅ | ⚠️ | ✅ | ✅ |
+| Community | Large | N/A | Medium | Growing |
+| Maturity | Production | Mature | Production | Maturing |
+
+<Info>
+The platform chose Delta Lake for its mature streaming integration, excellent Spark support, and powerful Change Data Feed feature critical for incremental processing.
+</Info>
+
+## Resources
+
+<CardGroup cols={2}>
+  <Card title="Delta Lake Documentation" icon="book" href="https://docs.delta.io/latest/">
+    Official Delta Lake documentation and API reference
+  </Card>
+  <Card title="Delta Lake GitHub" icon="github" href="https://github.com/delta-io/delta">
+    Source code, issues, and community discussions
+  </Card>
+  <Card title="Bronze Layer" icon="arrow-left" href="/storage/bronze-layer">
+    See how Bronze Layer uses Delta for raw ingestion
+  </Card>
+  <Card title="Silver Layer" icon="arrow-left" href="/storage/silver-layer">
+    See how Silver Layer leverages MERGE and CDF
+  </Card>
+</CardGroup>
