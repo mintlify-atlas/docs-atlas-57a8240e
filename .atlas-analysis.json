@@ -1,0 +1,115 @@
+{
+  "projectType": "data-platform",
+  "projectName": "Entertainment Data Platform",
+  "projectDescription": "A distributed data platform that ingests and organizes movie, TV series, and people data to enable interactive search, analytics, and retrieval-augmented generation applications.",
+  "theme": "sequoia",
+  "primaryColor": "#94cb04",
+  "lightColor": "#545454",
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "introduction",
+              "architecture",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/medallion-architecture",
+              "concepts/data-model",
+              "concepts/change-tracking"
+            ]
+          },
+          {
+            "group": "Components",
+            "pages": [
+              "components/collector",
+              "components/ingestion",
+              "components/stream-processor",
+              "components/batch-jobs"
+            ]
+          },
+          {
+            "group": "Storage Layers",
+            "pages": [
+              "storage/bronze-layer",
+              "storage/silver-layer",
+              "storage/gold-layer",
+              "storage/delta-lake"
+            ]
+          },
+          {
+            "group": "Serving Systems",
+            "pages": [
+              "serving/clickhouse",
+              "serving/neo4j",
+              "serving/pinecone"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/local-setup",
+              "deployment/docker",
+              "deployment/kubernetes"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/configuration",
+              "operations/monitoring",
+              "operations/troubleshooting"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Modules",
+            "pages": [
+              "api/collector",
+              "api/ingestion",
+              "api/stream-processor",
+              "api/batch-jobs"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Medallion Architecture (Bronze → Silver → Gold) with Delta Lake",
+    "Real-time stream processing with Apache Kafka and Spark Structured Streaming",
+    "Dead Letter Queue (DLQ) for fault-tolerant ingestion",
+    "Change-driven sync optimization for Neo4j and Pinecone",
+    "Multi-model data serving: OLAP (ClickHouse), Graph (Neo4j), Vector (Pinecone)",
+    "Production-ready deployment with Docker Compose and Kubernetes",
+    "Intelligent change-tracking mechanism to minimize downstream updates",
+    "Apache Airflow orchestration for batch ETL pipelines"
+  ],
+  "publicApiSurface": [
+    "collector.craw_api.tmdb - TMDB data collection",
+    "ingestion.loader - Data loading and mixing",
+    "ingestion.producer - Kafka event publishing",
+    "stream_processor.sources - Kafka consumption",
+    "stream_processor.processor - Stream transformation logic",
+    "stream_processor.sinks - Delta Lake writers",
+    "batch_jobs.pipelines.bronze_silver.minio_to_minio - Bronze to Silver transformation",
+    "batch_jobs.pipelines.silver_silver.minio_to_clickhouse - Silver to ClickHouse sync",
+    "batch_jobs.pipelines.silver_gold.clickhouse_to_neo4j - Graph database sync",
+    "batch_jobs.pipelines.silver_gold.clickhouse_to_pinecone - Vector database sync",
+    "batch_jobs.io.readers - Data readers for Delta Lake and ClickHouse",
+    "batch_jobs.io.writers - Data writers for all target databases",
+    "batch_jobs.transforms - Data transformation utilities"
+  ]
+}
